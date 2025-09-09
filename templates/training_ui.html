@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture Training Pipeline</title>
+    <style>
+        :root {
+            --primary: #2c3e50;
+            --secondary: #3498db;
+            --accent: #e74c3c;
+            --success: #27ae60;
+            --warning: #f39c12;
+            --light: #ecf0f1;
+            --dark: #2c3e50;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: var(--light);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);            async function apiCall(url, options = {}) {
+                const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+                const maxRetries = 3;
+                let attempt = 0;
+                
+                while (attempt < maxRetries) {
+                    try {
+                        const response = await fetch(url, {
+                            ...options,
+                            headers: {
+                                ...options.headers,
+                                'X-CSRF-TOKEN': csrfToken,
+                                'Content-Type': 'application/json'
+                            }
+                        });
+                        
+                        const data = await response.json();
+                        if (!response.ok) {
+                            throw new Error(data.message || 'API call failed');
+                        }
+                        return data;
+                    } catch (error) {
+                        attempt++;
+                        if (attempt === maxRetries) {
+                            showAlert(`Failed after ${maxRetries} attempts: ${error.message}`, 'error');
+                            throw error;
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+                    }
+                }
+            }
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            background: linear-gradient(45deg, #fff, #3498db);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            font-size: 1.2rem;
+            opacity: 0.9;
+            margin-bottom: 20px;
+        }
+        
+        .training-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+        
+        @media (max-width: 900px) {
+            .training-container {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .video-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        #training-video {
+            width: 100%;
+            max-width: 640px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            background: #000;
+            min-height: 360px;
+        }
+        
+        .training-controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center;
+            margin: 20px 0;
+        }
+        
+        .control-btn {
+            background: linear-gradient(45deg, var(--secondary), #2980b9);
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .control-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+        }
+        
+        .control-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .control-btn.emergency {
+            background: linear-gradient(45deg, var(--accent), #c0392b);
+        }
+        
+        .control-btn.success {
+            background: linear-gradient(45deg, var(--success), #229954);
+        }
+        
+        .info-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+        }
+        
+        .status-panel {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .status-card {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        
+        .status-card h3 {
+            color: var(--secondary);
+            margin-bottom: 10px;
+            font-size: 1rem;
+        }
+        
+        .status-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--light);
+        }
+        
+        .progress-container {
+            margin: 20px 0;
+        }
+        
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+        }
+        
+        .progress-bar {
+            height: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(45deg, var(--secondary), #2980b9);
+            border-radius: 10px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        
+        .gesture-selection {
+            margin: 20px 0;
+        }
+        
+        .gesture-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .gesture-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            padding: 10px;
+            color: white;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+        }
+        
+        .gesture-btn:hover {
+            background: rgba(52, 152, 219, 0.3);
+        }
+        
+        .gesture-btn.active {
+            background: rgba(39, 174, 96, 0.3);
+            border-color: var(--success);
+            box-shadow: 0 0 10px rgba(39, 174, 96, 0.5);
+        }
+        
+        .instructions {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        
+        .instructions h3 {
+            color: var(--secondary);
+            margin-bottom: 10px;
+        }
+        
+        .instruction-step {
+            display: flex;
+            margin-bottom: 10px;
+            align-items: flex-start;
+        }
+        
+        .step-number {
+            background: var(--secondary);
+            color: white;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 10px;
+            flex-shrink: 0;
+            font-size: 0.8rem;
+        }
+        
+        .training-status {
+            text-align: center;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            font-weight: bold;
+        }
+        
+        .status-recording {
+            background: rgba(231, 76, 60, 0.2);
+            border: 1px solid var(--accent);
+            color: var(--accent);
+            animation: pulse 1.5s infinite;
+        }
+        
+        .status-ready {
+            background: rgba(39, 174, 96, 0.2);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+        
+        .status-waiting {
+            background: rgba(243, 156, 18, 0.2);
+            border: 1px solid var(--warning);
+            color: var(--warning);
+        }
+        
+        .visual-feedback {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 15px 0;
+            gap: 8px;
+        }
+        
+        .feedback-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--accent);
+            transition: all 0.3s;
+        }
+        
+        .feedback-dot.active {
+            background: var(--success);
+            transform: scale(1.3);
+            box-shadow: 0 0 8px var(--success);
+        }
+        
+        .countdown {
+            font-size: 3rem;
+            font-weight: bold;
+            text-align: center;
+            margin: 20px 0;
+            color: var(--secondary);
+            display: none;
+        }
+        
+        .status-alert {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px;
+            border-radius: 10px;
+            z-index: 1000;
+            max-width: 300px;
+            display: none;
+            font-weight: bold;
+        }
+        
+        .status-alert.success {
+            background: rgba(39, 174, 96, 0.2);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+        
+        .status-alert.error {
+            background: rgba(231, 76, 60, 0.2);
+            border: 1px solid var(--accent);
+            color: var(--accent);
+        }
+        
+        .status-alert.warning {
+            background: rgba(243, 156, 18, 0.2);
+            border: 1px solid var(--warning);
+            color: var(--warning);
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .back-button {
+            display: inline-flex;
+            align-items: center;
+            background: var(--secondary);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            text-decoration: none;
+            margin-top: 20px;
+            transition: all 0.3s;
+        }
+        
+        .back-button:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+        }
+        
+        .training-results {
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            display: none;
+        }
+        
+        .training-results h3 {
+            color: var(--secondary);
+            margin-bottom: 10px;
+        }
+        
+        .result-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .result-item:last-child {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }
+        
+        .reset-btn {
+            background: linear-gradient(45deg, var(--warning), #e67e22);
+            border: none;
+            padding: 8px 15px;
+            border-radius: 6px;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        
+        .error-message {
+            color: #e74c3c;
+            background: rgba(231, 76, 60, 0.1);
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 10px;
+            text-align: center;
+        }
+    </style>
+    <!-- Add CSRF token -->
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <!-- Add noscript warning -->
+    <noscript>
+        <div class="error-message">
+            This application requires JavaScript to be enabled.
+        </div>
+    </noscript>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎓 Gesture Training Pipeline</h1>
+            <p class="subtitle">Collect training data and train your custom gesture recognition model</p>
+        </header>
+        
+        <div class="training-container">
+            <div class="video-section">
+                <video id="training-video" autoplay playsinline></video>
+                <canvas id="training-canvas" style="display: none;"></canvas>
+                
+                <div class="countdown" id="countdown">3</div>
+                
+                <div class="training-controls">
+                    <button class="control-btn" id="start-camera-btn" onclick="initCamera()">📷 Start Camera</button>
+                    <button class="control-btn" id="start-training-btn" onclick="startTraining()" disabled>🎬 Start Training</button>
+                    <button class="control-btn" id="stop-training-btn" onclick="stopTraining()" disabled>⏹️ Stop Training</button>
+                    <button class="control-btn success" id="train-model-btn" onclick="trainModel()" disabled>🤖 Train Model</button>
+                    <button class="control-btn emergency" id="reset-training-btn" onclick="resetTraining()">🔄 Reset Training</button>
+                </div>
+                
+                <div class="training-status" id="training-status">Waiting for camera access...</div>
+                
+                <div class="visual-feedback">
+                    <div class="feedback-dot" id="feedback-dot-1"></div>
+                    <div class="feedback-dot" id="feedback-dot-2"></div>
+                    <div class="feedback-dot" id="feedback-dot-3"></div>
+                    <div class="feedback-dot" id="feedback-dot-4"></div>
+                    <div class="feedback-dot" id="feedback-dot-5"></div>
+                </div>
+            </div>
+            
+            <div class="info-section">
+                <div class="status-panel">
+                    <div class="status-card">
+                        <h3>Current Gesture</h3>
+                        <div class="status-value" id="current-gesture">None</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>Samples Collected</h3>
+                        <div class="status-value" id="samples-collected">0</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>Training Progress</h3>
+                        <div class="status-value" id="training-progress">0%</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>Model Accuracy</h3>
+                        <div class="status-value" id="model-accuracy">N/A</div>
+                    </div>
+                </div>
+                
+                <div class="progress-container">
+                    <div class="progress-header">
+                        <span>Overall Progress</span>
+                        <span id="progress-percentage">0%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                </div>
+                
+                <div class="gesture-selection">
+                    <h3>Select Gesture to Train</h3>
+                    <div class="gesture-grid">
+                        <div class="gesture-btn" data-gesture="cursor_mode">🖱️ Cursor Mode</div>
+                        <div class="gesture-btn" data-gesture="click">👆 Click</div>
+                        <div class="gesture-btn" data-gesture="right_click">👉 Right Click</div>
+                        <div class="gesture-btn" data-gesture="double_click">👆👆 Double Click</div>
+                        <div class="gesture-btn" data-gesture="drag">👐 Drag</div>
+                        <div class="gesture-btn" data-gesture="scroll_up">🖐️ Scroll Up</div>
+                        <div class="gesture-btn" data-gesture="scroll_down">🖐️ Scroll Down</div>
+                        <div class="gesture-btn" data-gesture="zoom_in">🔍 Zoom In</div>
+                        <div class="gesture-btn" data-gesture="zoom_out">🔍 Zoom Out</div>
+                        <div class="gesture-btn" data-gesture="back">↩️ Back</div>
+                        <div class="gesture-btn" data-gesture="forward">↪️ Forward</div>
+                        <div class="gesture-btn" data-gesture="volume_up">🔊 Vol Up</div>
+                        <div class="gesture-btn" data-gesture="volume_down">🔉 Vol Down</div>
+                        <div class="gesture-btn" data-gesture="mute">🔇 Mute</div>
+                        <div class="gesture-btn" data-gesture="play_pause">⏯️ Play/Pause</div>
+                    </div>
+                </div>
+                
+                <div class="instructions">
+                    <h3>Training Instructions</h3>
+                    <div class="instruction-step">
+                        <div class="step-number">1</div>
+                        <div>Start your camera and allow access when prompted</div>
+                    </div>
+                    <div class="instruction-step">
+                        <div class="step-number">2</div>
+                        <div>Select a gesture from the list above</div>
+                    </div>
+                    <div class="instruction-step">
+                        <div class="step-number">3</div>
+                        <div>Click "Start Training" and perform the gesture when countdown completes</div>
+                    </div>
+                    <div class="instruction-step">
+                        <div class="step-number">4</div>
+                        <div>Hold the gesture for 2-3 seconds until feedback confirms recording</div>
+                    </div>
+                    <div class="instruction-step">
+                        <div class="step-number">5</div>
+                        <div>Repeat for multiple angles and variations of the same gesture</div>
+                    </div>
+                    <div class="instruction-step">
+                        <div class="step-number">6</div>
+                        <div>Collect at least 20 samples per gesture for good accuracy</div>
+                    </div>
+                    <div class="instruction-step">
+                        <div class="step-number">7</div>
+                        <div>Click "Train Model" when you've collected enough samples</div>
+                    </div>
+                </div>
+                
+                <div class="training-results" id="training-results">
+                    <h3>Training Results</h3>
+                    <div class="result-item">
+                        <span>Total Samples:</span>
+                        <span id="result-samples">0</span>
+                    </div>
+                    <div class="result-item">
+                        <span>Training Accuracy:</span>
+                        <span id="result-accuracy">0%</span>
+                    </div>
+                    <div class="result-item">
+                        <span>Validation Accuracy:</span>
+                        <span id="result-val-accuracy">0%</span>
+                    </div>
+                    <div class="result-item">
+                        <span>Training Loss:</span>
+                        <span id="result-loss">0</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div style="text-align: center; margin-top: 30px;">
+            <a href="/" class="back-button">⬅️ Back to Control Interface</a>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let currentGesture = null;
+        let isTraining = false;
+        let isCameraActive = false;
+        let mediaStream = null;
+        let samplesCollected = 0;
+        let totalSamples = 0;
+        let trainingData = [];
+        let videoElement = null;
+        let canvasElement = null;
+        let canvasContext = null;
+        let animationFrame = null;
+        let captureInterval = null;
+        
+        // Gesture samples counter
+        const gestureSamples = {};
+        
+        // Initialize the page
+        document.addEventListener('DOMContentLoaded', function() {
+            videoElement = document.getElementById('training-video');
+            canvasElement = document.getElementById('training-canvas');
+            canvasContext = canvasElement.getContext('2d');
+            
+            // Set up gesture buttons
+            document.querySelectorAll('.gesture-btn').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    selectGesture(this.dataset.gesture);
+                });
+            });
+            
+            // Initialize gesture samples counter
+            document.querySelectorAll('.gesture-btn').forEach(btn => {
+                gestureSamples[btn.dataset.gesture] = 0;
+            });
+            
+            // Initial status update
+            updateTrainingStatus();
+        });
+        
+        // API call wrapper with error handling
+        async function apiCall(url, options = {}) {
+            try {
+                const response = await fetch(url, options);
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.message || 'API call failed');
+                }
+                
+                return data;
+            } catch (error) {
+                console.error('API Error:', error);
+                showAlert(error.message, 'error');
+                throw error;
+            }
+        }
+        
+        // Show status alert
+        function showAlert(message, type = 'success') {
+            // Create alert element if it doesn't exist
+            let alertElement = document.getElementById('status-alert');
+            if (!alertElement) {
+                alertElement = document.createElement('div');
+                alertElement.id = 'status-alert';
+                document.body.appendChild(alertElement);
+            }
+            
+            alertElement.textContent = message;
+            alertElement.className = `status-alert ${type}`;
+            alertElement.style.display = 'block';
+            
+            setTimeout(() => {
+                alertElement.style.display = 'none';
+            }, 3000);
+        }
+        
+        // Initialize camera
+        async function initCamera() {
+            try {
+                const statusElement = document.getElementById('training-status');
+                statusElement.textContent = 'Accessing camera...';
+                statusElement.className = 'training-status status-waiting';
+                
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 640, height: 480 } 
+                });
+                
+                videoElement.srcObject = mediaStream;
+                isCameraActive = true;
+                
+                statusElement.textContent = 'Camera ready. Select a gesture to train.';
+                statusElement.className = 'training-status status-ready';
+                
+                document.getElementById('start-camera-btn').disabled = true;
+                document.getElementById('start-training-btn').disabled = false;
+                
+                // Start video processing
+                processVideo();
+                
+            } catch (error) {
+                console.error('Error accessing camera:', error);
+                document.getElementById('training-status').textContent = 
+                    'Camera access denied. Please allow camera access to continue.';
+                document.getElementById('training-status').className = 'training-status status-recording';
+            }
+        }
+        
+        // Process video frames
+        function processVideo() {
+            if (!isCameraActive) return;
+            
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+            canvasContext.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+            
+            // Here we would normally process the frame with MediaPipe or similar
+            // For this example, we'll just draw a simple visualization
+            
+            if (isTraining && currentGesture) {
+                // Draw a circle that pulses when recording
+                const centerX = canvasElement.width / 2;
+                const centerY = canvasElement.height / 2;
+                const radius = 50 + 10 * Math.sin(Date.now() / 200);
+                
+                canvasContext.beginPath();
+                canvasContext.arc(centerX, centerY, radius, 0, 2 * Math.PI);
+                canvasContext.strokeStyle = '#e74c3c';
+                canvasContext.lineWidth = 4;
+                canvasContext.stroke();
+                
+                // Add text showing the current gesture
+                canvasContext.font = '20px Arial';
+                canvasContext.fillStyle = '#3498db';
+                canvasContext.textAlign = 'center';
+                canvasContext.fillText(`Training: ${currentGesture.replace('_', ' ')}`, centerX, 40);
+                
+                // Add recording indicator
+                canvasContext.beginPath();
+                canvasContext.arc(30, 30, 10, 0, 2 * Math.PI);
+                canvasContext.fillStyle = '#e74c3c';
+                canvasContext.fill();
+            }
+            
+            animationFrame = requestAnimationFrame(processVideo);
+        }
+        
+        // Select a gesture to train
+        function selectGesture(gesture) {
+            currentGesture = gesture;
+            
+            // Update UI
+            document.getElementById('current-gesture').textContent = gesture.replace('_', ' ');
+            
+            // Highlight selected gesture
+            document.querySelectorAll('.gesture-btn').forEach(btn => {
+                if (btn.dataset.gesture === gesture) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
+            
+            // Enable training button if camera is active
+            if (isCameraActive) {
+                document.getElementById('start-training-btn').disabled = false;
+            }
+        }
+        
+        // Start training
+        async function startTraining() {
+            if (!currentGesture) {
+                showAlert('Please select a gesture first.', 'error');
+                return;
+            }
+            
+            try {
+                const data = await apiCall('/start_training', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gesture: currentGesture })
+                });
+                
+                isTraining = true;
+                document.getElementById('start-training-btn').disabled = true;
+                document.getElementById('stop-training-btn').disabled = false;
+                document.getElementById('training-status').textContent = 'Get ready to perform the gesture...';
+                document.getElementById('training-status').className = 'training-status status-waiting';
+                
+                // Start countdown
+                let count = 3;
+                const countdownElement = document.getElementById('countdown');
+                countdownElement.style.display = 'block';
+                countdownElement.textContent = count;
+                
+                const countdownInterval = setInterval(() => {
+                    count--;
+                    if (count > 0) {
+                        countdownElement.textContent = count;
+                    } else {
+                        clearInterval(countdownInterval);
+                        countdownElement.style.display = 'none';
+                        document.getElementById('training-status').textContent = 'Recording... Perform the gesture now!';
+                        document.getElementById('training-status').className = 'training-status status-recording';
+                        
+                        // Start visual feedback animation
+                        animateFeedbackDots();
+                        
+                        // Start capturing samples
+                        startCapturingSamples();
+                    }
+                }, 1000);
+                
+            } catch (error) {
+                console.error('Error starting training:', error);
+            }
+        }
+        
+        // Function to start capturing samples
+        function startCapturingSamples() {
+            if (!isTraining) return;
+            
+            // Clear any existing interval
+            if (captureInterval) {
+                clearInterval(captureInterval);
+            }
+            
+            // Capture a sample every 500ms
+            captureInterval = setInterval(async () => {
+                if (!isTraining) {
+                    clearInterval(captureInterval);
+                    return;
+                }
+                
+                try {
+                    const data = await apiCall('/capture_sample', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ gesture: currentGesture })
+                    });
+                    
+                    // Update UI with sample count
+                    document.getElementById('samples-collected').textContent = data.sample_count;
+                    gestureSamples[currentGesture] = data.sample_count;
+                    samplesCollected++;
+                    totalSamples++;
+                    
+                    updateProgress();
+                    
+                    // Provide visual feedback
+                    const feedbackElement = document.getElementById('training-status');
+                    feedbackElement.textContent = `Sample captured! (${data.sample_count} samples)`;
+                    
+                    setTimeout(() => {
+                        if (isTraining) {
+                            feedbackElement.textContent = 'Recording... Continue performing the gesture';
+                            feedbackElement.className = 'training-status status-recording';
+                        }
+                    }, 1000);
+                    
+                } catch (error) {
+                    console.error('Error capturing sample:', error);
+                }
+            }, 500);
+        }
+        
+        // Stop training
+        async function stopTraining() {
+            try {
+                isTraining = false;
+                
+                // Clear the capture interval
+                if (captureInterval) {
+                    clearInterval(captureInterval);
+                    captureInterval = null;
+                }
+                
+                document.getElementById('start-training-btn').disabled = false;
+                document.getElementById('stop-training-btn').disabled = true;
+                document.getElementById('training-status').textContent = 'Training stopped.';
+                document.getElementById('training-status').className = 'training-status status-ready';
+                
+                // Enable train model button if we have enough samples
+                if (totalSamples >= 20) {
+                    document.getElementById('train-model-btn').disabled = false;
+                }
+                
+            } catch (error) {
+                console.error('Error stopping training:', error);
+            }
+        }
+        
+        // Train the model
+        async function trainModel() {
+            if (totalSamples < 20) {
+                showAlert('Please collect at least 20 samples before training.', 'error');
+                return;
+            }
+            
+            document.getElementById('training-status').textContent = 'Training model... This may take a few minutes.';
+            document.getElementById('training-status').className = 'training-status status-waiting';
+            document.getElementById('train-model-btn').disabled = true;
+            
+            try {
+                const data = await apiCall('/train_model', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                
+                if (data.status === 'success') {
+                    // Training complete
+                    document.getElementById('training-status').textContent = 'Training complete!';
+                    document.getElementById('training-status').className = 'training-status status-ready';
+                    document.getElementById('model-accuracy').textContent = `${Math.round(data.accuracy * 100)}%`;
+                    
+                    // Show training results
+                    document.getElementById('training-results').style.display = 'block';
+                    document.getElementById('result-samples').textContent = totalSamples;
+                    document.getElementById('result-accuracy').textContent = `${Math.round(data.accuracy * 100)}%`;
+                    document.getElementById('result-val-accuracy').textContent = `${Math.round(data.val_accuracy * 100)}%`;
+                    document.getElementById('result-loss').textContent = data.loss.toFixed(3);
+                    
+                    // Enable model saving
+                    setTimeout(() => {
+                        if (confirm('Training complete! Would you like to save the model?')) {
+                            saveModel();
+                        }
+                    }, 1000);
+                } else {
+                    showAlert(data.message, 'error');
+                }
+                
+            } catch (error) {
+                console.error('Error training model:', error);
+                showAlert('Error training model. Please try again.', 'error');
+            }
+        }
+        
+        // Save the trained model
+        async function saveModel() {
+            try {
+                const data = await apiCall('/save_model', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                
+                if (data.status === 'success') {
+                    showAlert('Model saved successfully!', 'success');
+                    document.getElementById('training-status').textContent = 'Model saved successfully!';
+                } else {
+                    showAlert('Failed to save model.', 'error');
+                }
+                
+            } catch (error) {
+                console.error('Error saving model:', error);
+                showAlert('Error saving model. Please try again.', 'error');
+            }
+        }
+        
+        // Reset training data
+        async function resetTraining() {
+            if (confirm('Are you sure you want to reset all training data? This cannot be undone.')) {
+                try {
+                    const data = await apiCall('/reset_training', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    
+                    if (data.status === 'success') {
+                        showAlert('Training data reset successfully.', 'success');
+                        
+                        // Reset UI
+                        document.getElementById('samples-collected').textContent = '0';
+                        document.getElementById('training-progress').textContent = '0%';
+                        document.getElementById('model-accuracy').textContent = 'N/A';
+                        document.getElementById('progress-percentage').textContent = '0%';
+                        document.getElementById('progress-fill').style.width = '0%';
+                        document.getElementById('training-results').style.display = 'none';
+                        document.getElementById('train-model-btn').disabled = true;
+                        
+                        totalSamples = 0;
+                        samplesCollected = 0;
+                        
+                        // Reset gesture samples
+                        document.querySelectorAll('.gesture-btn').forEach(btn => {
+                            gestureSamples[btn.dataset.gesture] = 0;
+                        });
+                    } else {
+                        showAlert('Failed to reset training data.', 'error');
+                    }
+                } catch (error) {
+                    console.error('Error resetting training:', error);
+                    showAlert('Error resetting training data. Please try again.', 'error');
+                }
+            }
+        }
+        
+        // Update progress indicators
+        function updateProgress() {
+            const progressPercentage = Math.min(100, Math.floor((totalSamples / 300) * 100));
+            document.getElementById('progress-percentage').textContent = `${progressPercentage}%`;
+            document.getElementById('progress-fill').style.width = `${progressPercentage}%`;
+            document.getElementById('training-progress').textContent = `${progressPercentage}%`;
+        }
+        
+        // Animate feedback dots
+        function animateFeedbackDots() {
+            const dots = [
+                document.getElementById('feedback-dot-1'),
+                document.getElementById('feedback-dot-2'),
+                document.getElementById('feedback-dot-3'),
+                document.getElementById('feedback-dot-4'),
+                document.getElementById('feedback-dot-5')
+            ];
+            
+            dots.forEach((dot, index) => {
+                setTimeout(() => {
+                    dot.classList.add('active');
+                    setTimeout(() => {
+                        dot.classList.remove('active');
+                    }, 300);
+                }, index * 200);
+            });
+            
+            if (isTraining) {
+                setTimeout(animateFeedbackDots, 1500);
+            }
+        }
+        
+        // Get training status
+        async function updateTrainingStatus() {
+            try {
+                const data = await apiCall('/training_status');
+                
+                if (data.status === 'success') {
+                    // Update UI with training status
+                    if (data.current_gesture) {
+                        currentGesture = data.current_gesture;
+                        document.getElementById('current-gesture').textContent = currentGesture.replace('_', ' ');
+                        document.getElementById('samples-collected').textContent = data.samples_collected;
+                        
+                        // Highlight selected gesture
+                        document.querySelectorAll('.gesture-btn').forEach(btn => {
+                            if (btn.dataset.gesture === currentGesture) {
+                                btn.classList.add('active');
+                            } else {
+                                btn.classList.remove('active');
+                            }
+                        });
+                    }
+                    
+                    totalSamples = data.total_samples;
+                    isTraining = data.is_training;
+                    
+                    updateProgress();
+                    
+                    // Update button states
+                    document.getElementById('start-training-btn').disabled = !currentGesture || isTraining;
+                    document.getElementById('stop-training-btn').disabled = !isTraining;
+                    document.getElementById('train-model-btn').disabled = totalSamples < 20;
+                    
+                    // Update training status text
+                    if (isTraining) {
+                        document.getElementById('training-status').textContent = 'Recording... Perform the gesture now!';
+                        document.getElementById('training-status').className = 'training-status status-recording';
+                    } else if (currentGesture) {
+                        document.getElementById('training-status').textContent = 'Ready to train. Click Start Training.';
+                        document.getElementById('training-status').className = 'training-status status-ready';
+                    }
+                }
+            } catch (error) {
+                console.error('Error getting training status:', error);
+            }
+        }
+        
+        // Call updateTrainingStatus periodically
+        setInterval(updateTrainingStatus, 2000);
+        
+        // Clean up when leaving the page
+        window.addEventListener('beforeunload', () => {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+            }
+            
+            if (captureInterval) {
+                clearInterval(captureInterval);
+            }
+        });
+    </script>
+</body>
+</html>

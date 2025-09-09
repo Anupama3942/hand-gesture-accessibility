@@ -1,0 +1,15 @@
+{
+    "sensitivity": 1,
+    "voice_feedback": true,
+    "cursor_speed": 1.1,
+    "scroll_speed": 65,
+    "zoom_sensitivity": 1.2,
+    "gesture_hold_time": 1,
+    "double_click_speed": 0.3,
+    "gesture_confidence_threshold": 0.5,
+    "voice_control": false,
+    "auto_calibration": true,
+    "dark_mode": false,
+    "audio_feedback": true,
+    "haptic_feedback": false
+}
