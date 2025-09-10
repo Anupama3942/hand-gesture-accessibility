@@ -6,18 +6,14 @@ from accessibility_controller import AccessibilityController
 import time
 import os
 import shutil
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def collect_gesture_data():
-    """Collect training data for specific gestures"""
-    controller = AccessibilityController()
-    
-    # Delete the old model if it exists (to force creating a new one)
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'accessibility_gesture_model.h5')
-    if os.path.exists(model_path):
-        os.remove(model_path)
-        print("Deleted old model to create a new one")
-    
-    # Reinitialize the controller to create a new model
+    """Collect training data for specific gestures using standardized format"""
     controller = AccessibilityController()
     
     # Initialize camera
@@ -33,9 +29,11 @@ def collect_gesture_data():
     
     print("Gesture Data Collection")
     print("======================")
+    print("Using standardized data format")
+    print("")
     
     for i, gesture in enumerate(gestures):
-        print(f"\n{i+1}. {gesture}")
+        print(f"{i+1}. {gesture}")
     
     try:
         choice = int(input("\nSelect gesture to collect (number): ")) - 1
@@ -51,8 +49,10 @@ def collect_gesture_data():
         print("Make sure your hand is clearly visible in the camera")
         
         samples_collected = 0
+        failed_attempts = 0
+        max_failed_attempts = 10
         
-        while samples_collected < samples_to_collect:
+        while samples_collected < samples_to_collect and failed_attempts < max_failed_attempts:
             ret, frame = cap.read()
             if not ret:
                 continue
@@ -84,28 +84,22 @@ def collect_gesture_data():
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('c'):
-                # Capture sample
-                if results and results.multi_hand_landmarks:
-                    keypoints = controller.extract_keypoints(results)
-                    if keypoints is not None and np.any(keypoints) and not np.all(keypoints == 0):
-                        # Add to training data
-                        if selected_gesture not in controller.training_data:
-                            controller.training_data[selected_gesture] = []
-                        
-                        controller.training_data[selected_gesture].append({
-                            'keypoints': keypoints,
-                            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                        
-                        samples_collected += 1
-                        print(f"Captured sample {samples_collected}/{samples_to_collect}")
-                    else:
-                        print("Invalid keypoints (all zeros or no hand detected)")
+                # Capture sample using controller's standardized method
+                sample_count = controller.capture_training_sample(selected_gesture)
+                
+                if sample_count > 0:
+                    samples_collected = sample_count
+                    print(f"Captured sample {samples_collected}/{samples_to_collect}")
+                    failed_attempts = 0
                 else:
-                    print("No hand detected")
+                    print("Failed to capture sample. Ensure hand is visible.")
+                    failed_attempts += 1
             
             elif key == ord('q'):
                 break
+        
+        if failed_attempts >= max_failed_attempts:
+            print("\nToo many failed attempts. Stopping collection.")
         
         # Save training data
         if samples_collected > 0:
@@ -129,9 +123,97 @@ def collect_gesture_data():
     
     except ValueError:
         print("Please enter a valid number")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+def batch_collect_gestures():
+    """Collect data for multiple gestures in batch mode"""
+    controller = AccessibilityController()
     
-    cap.release()
-    cv2.destroyAllWindows()
+    gestures = controller.gestures[1:]  # Skip 'none' gesture
+    samples_per_gesture = 20
+    
+    print("Batch Gesture Data Collection")
+    print("============================")
+    print(f"Will collect {samples_per_gesture} samples for each gesture")
+    print("")
+    
+    for gesture in gestures:
+        print(f"Collecting data for: {gesture}")
+        print("Perform the gesture and press 'c' to capture samples")
+        print("Press 'q' to quit or 'n' for next gesture")
+        print("")
+        
+        samples_collected = 0
+        
+        # Initialize camera for this gesture
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        while samples_collected < samples_per_gesture:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            
+            frame = cv2.flip(frame, 1)
+            image, results = controller.mediapipe_detection(frame)
+            image = controller.draw_landmarks(image, results)
+            
+            # Display instructions
+            cv2.putText(image, f"Gesture: {gesture}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(image, f"Samples: {samples_collected}/{samples_per_gesture}", (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            cv2.imshow('Batch Collection', image)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('c'):
+                sample_count = controller.capture_training_sample(gesture)
+                if sample_count > 0:
+                    samples_collected = sample_count
+                    print(f"Captured sample {samples_collected}/{samples_per_gesture}")
+            
+            elif key == ord('n'):
+                print(f"Moving to next gesture. Collected {samples_collected} samples for {gesture}")
+                break
+            
+            elif key == ord('q'):
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+        
+        cap.release()
+        cv2.destroyAllWindows()
+    
+    # Save all data and train model
+    controller.save_training_data()
+    print("\nAll data collected. Training model...")
+    
+    result = controller.train_model()
+    if result["status"] == "success":
+        print(f"Model trained successfully! Accuracy: {result['accuracy']:.2%}")
+        if controller.save_model():
+            print("Model saved successfully!")
+    else:
+        print(f"Training failed: {result['message']}")
 
 if __name__ == "__main__":
-    collect_gesture_data()
+    print("Choose collection mode:")
+    print("1. Single gesture collection")
+    print("2. Batch collection (all gestures)")
+    
+    try:
+        choice = int(input("Enter choice (1 or 2): "))
+        if choice == 1:
+            collect_gesture_data()
+        elif choice == 2:
+            batch_collect_gestures()
+        else:
+            print("Invalid choice")
+    except ValueError:
+        print("Please enter a valid number")

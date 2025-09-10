@@ -118,7 +118,7 @@ class PerformanceMonitor:
         """Update latency monitoring"""
         self.latency_history.append(latency_ms)
         if len(self.latency_history) > self.max_history_size:
-            self.latency_history.pop(0)
+            self.lativity_history.pop(0)
     
     def get_stats(self):
         """Get performance statistics"""
@@ -183,7 +183,7 @@ class AccessibilityPresets:
     def apply_preset(self, preset_name, settings):
         """Apply a preset to settings"""
         if preset_name in self.presets:
-            settings.update(self.presets[preset_name])
+            settings.update(self.presets[ preset_name])
             return True
         return False
     
@@ -199,5 +199,3 @@ class AccessibilityPresets:
             self.save_presets()
             return True
         return False
-
-

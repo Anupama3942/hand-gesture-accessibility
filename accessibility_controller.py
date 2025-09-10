@@ -16,6 +16,7 @@ import subprocess
 from datetime import datetime
 import pickle
 import logging
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -68,7 +69,9 @@ class AccessibilityController:
         self.cursor_mode = False
         self.dragging = False
         
-        # Voice feedback (text-to-speech only)
+        # Voice feedback (text-to-speech only) - optional
+        self.voice_engine = None
+        self.voice_enabled = False
         try:
             self.voice_engine = pyttsx3.init()
             self.voice_engine.setProperty('rate', 150)
@@ -76,7 +79,7 @@ class AccessibilityController:
             self.voice_enabled = True
             logger.info("Voice engine initialized successfully")
         except Exception as e:
-            logger.error(f"Voice engine initialization failed: {e}")
+            logger.warning(f"Voice engine initialization failed (optional feature): {e}")
             self.voice_engine = None
             self.voice_enabled = False
         
@@ -120,41 +123,91 @@ class AccessibilityController:
             'frame_count': 0
         }
         
-    # Training methods
+    def get_status_for_json(self):
+        """Get status data that can be serialized to JSON"""
+        hand_detected = self.current_results and self.current_results.multi_hand_landmarks
+        hand_count = len(self.current_results.multi_hand_landmarks) if hand_detected else 0
+        
+        # Convert any numpy arrays to lists for JSON serialization
+        settings_serializable = {}
+        for key, value in self.settings.items():
+            if isinstance(value, (np.integer, np.floating)):
+                settings_serializable[key] = float(value)
+            elif isinstance(value, np.ndarray):
+                settings_serializable[key] = value.tolist()
+            else:
+                settings_serializable[key] = value
+        
+        return {
+            "running": self.running,
+            "cursor_mode": self.cursor_mode,
+            "voice_enabled": self.voice_enabled,
+            "current_gesture": self.current_gesture,
+            "hand_detected": hand_detected,
+            "hand_count": hand_count,
+            "settings": settings_serializable
+        }
+
+    # Standardized Training Data Methods
     def load_training_data(self):
-        """Load training data from file"""
+        """Load training data from file using standardized format"""
         training_dir = os.path.dirname(self.training_samples_path)
         os.makedirs(training_dir, exist_ok=True)
         
         if os.path.exists(self.training_samples_path):
             try:
                 with open(self.training_samples_path, 'rb') as f:
-                    self.training_data = pickle.load(f)
-                logger.info(f"Loaded {sum(len(samples) for samples in self.training_data.values())} training samples")
+                    data = pickle.load(f)
+                    # Convert old format to new standardized format if needed
+                    if isinstance(data, dict) and all(isinstance(samples, list) for samples in data.values()):
+                        self.training_data = data
+                        logger.info(f"Loaded {sum(len(samples) for samples in self.training_data.values())} training samples")
+                    else:
+                        logger.warning("Training data format is invalid, initializing empty data")
+                        self.training_data = {}
             except Exception as e:
                 logger.error(f"Error loading training data: {e}")
+                # Initialize empty training data instead of crashing
                 self.training_data = {}
         else:
             self.training_data = {}
             
     def save_training_data(self):
-        """Save training data to file"""
+        """Save training data to file using standardized format"""
         try:
             training_dir = os.path.dirname(self.training_samples_path)
             os.makedirs(training_dir, exist_ok=True)
             
+            # Ensure data is in correct format before saving
+            validated_data = {}
+            for gesture, samples in self.training_data.items():
+                if gesture in self.gestures and isinstance(samples, list):
+                    validated_data[gesture] = samples
+            
             with open(self.training_samples_path, 'wb') as f:
-                pickle.dump(self.training_data, f)
+                pickle.dump(validated_data, f)
             logger.info("Training data saved successfully")
             return True
         except Exception as e:
             logger.error(f"Error saving training data: {e}")
             return False
-          
+    
+    def validate_training_sample(self, keypoints):
+        """Validate a training sample meets requirements"""
+        if not isinstance(keypoints, np.ndarray):
+            return False
+        if keypoints.shape != (63,):  # 21 landmarks * 3 coordinates
+            return False
+        if np.all(keypoints == 0) or not np.any(keypoints):
+            return False
+        if np.any(np.isnan(keypoints)) or np.any(np.isinf(keypoints)):
+            return False
+        return True
+    
     def start_training(self, gesture):
         """Start training mode for a specific gesture"""
-        if gesture not in self.gestures:
-            logger.warning(f"Unknown gesture: {gesture}")
+        if not self.validate_gesture_name(gesture):
+            logger.warning(f"Invalid gesture name: {gesture}")
             return False
 
         self.is_training = True
@@ -168,13 +221,6 @@ class AccessibilityController:
         self.speak(f"Training {gesture.replace('_', ' ')}")
         return True
     
-    def stop_training(self):
-        """Stop training mode"""
-        self.is_training = False
-        self.training_gesture = None
-        logger.info("Training stopped")
-        self.speak("Training stopped")
-    
     def capture_training_sample(self, gesture):
         """Capture a training sample for the current gesture"""
         if not self.is_training or gesture != self.training_gesture:
@@ -186,13 +232,17 @@ class AccessibilityController:
                 # Extract keypoints from the current frame
                 keypoints = self.extract_keypoints(self.current_results)
                 
-                # Only save valid samples (not all zeros)
-                if np.any(keypoints) and not np.all(keypoints == 0):
-                    # Add to training data
-                    self.training_data[gesture].append({
+                # Validate sample
+                if self.validate_training_sample(keypoints):
+                    # Add to training data with standardized format
+                    sample = {
                         'keypoints': keypoints,
-                        'timestamp': datetime.now().isoformat()
-                    })
+                        'timestamp': datetime.now().isoformat(),
+                        'gesture': gesture,
+                        'version': '1.0'  # Standardized format version
+                    }
+                    
+                    self.training_data[gesture].append(sample)
                     
                     # Save training data
                     self.save_training_data()
@@ -202,7 +252,7 @@ class AccessibilityController:
                     
                     return sample_count
                 else:
-                    logger.warning("Invalid sample (all zeros or no hand detected)")
+                    logger.warning("Invalid sample (validation failed)")
                     return 0
                 
             except Exception as e:
@@ -213,7 +263,7 @@ class AccessibilityController:
             return 0
     
     def train_model(self):
-        """Train the model with collected samples"""
+        """Train the model with collected samples using standardized format"""
         try:
             # Check if we have enough training data
             total_samples = sum(len(samples) for samples in self.training_data.values())
@@ -223,16 +273,16 @@ class AccessibilityController:
                     "message": f"Not enough training data. Need at least 20 samples, have {total_samples}"
                 }
             
-            # Prepare training data
+            # Prepare training data using standardized format
             X_train = []
             y_train = []
             
             for i, gesture in enumerate(self.gestures):
                 if gesture in self.training_data and self.training_data[gesture]:
                     for sample in self.training_data[gesture]:
-                        # Ensure we have the right number of keypoints and they're valid
-                        if (len(sample['keypoints']) == 63 and  # 21 landmarks * 3 coordinates
-                            np.any(sample['keypoints']) and not np.all(sample['keypoints'] == 0)):
+                        # Ensure we have valid samples in standardized format
+                        if (self.validate_training_sample(sample['keypoints']) and 
+                            sample.get('gesture') == gesture):
                             X_train.append(sample['keypoints'])
                             y_train.append(i)
             
@@ -297,17 +347,30 @@ class AccessibilityController:
     def save_model(self):
         """Save the trained model to file"""
         try:
-            model_dir = os.path.dirname(self.model_path)
-            os.makedirs(model_dir, exist_ok=True)
-            self.model.save(self.model_path)
-            logger.info("Model saved successfully")
-            return True
+            if self.model is not None:
+                model_dir = os.path.dirname(self.model_path)
+                os.makedirs(model_dir, exist_ok=True)
+                self.model.save(self.model_path)
+                logger.info("Model saved successfully")
+                return True
+            return False
         except Exception as e:
             logger.error(f"Error saving model: {e}")
             return False
     
+    def validate_gesture_name(self, gesture):
+        """Validate gesture name format"""
+        if not isinstance(gesture, str):
+            return False
+        if gesture not in self.gestures:
+            return False
+        # Allow only alphanumeric and underscore characters
+        if not re.match(r'^[a-zA-Z0-9_]+$', gesture):
+            return False
+        return True
+    
     def get_training_status(self):
-        """Get training status and statistics"""
+        """Get training status and statistics with standardized format"""
         total_samples = sum(len(samples) for samples in self.training_data.values())
         current_samples = len(self.training_data[self.training_gesture]) if self.training_gesture in self.training_data else 0
         
@@ -315,16 +378,20 @@ class AccessibilityController:
             "current_gesture": self.training_gesture,
             "samples_collected": current_samples,
             "total_samples": total_samples,
-            "is_training": self.is_training
+            "is_training": self.is_training,
+            "gestures_trained": [g for g in self.gestures if g in self.training_data and self.training_data[g]],
+            "format_version": "1.0"
         }
     
     def reset_training_data(self, gesture=None):
         """Reset training data for a specific gesture or all gestures"""
         try:
             if gesture:
-                if gesture in self.training_data:
+                if self.validate_gesture_name(gesture) and gesture in self.training_data:
                     self.training_data[gesture] = []
                     logger.info(f"Reset training data for {gesture}")
+                else:
+                    return False
             else:
                 self.training_data = {}
                 logger.info("Reset all training data")
@@ -334,8 +401,47 @@ class AccessibilityController:
             
         except Exception as e:
             logger.error(f"Error resetting training data: {e}")
-            return False 
+            return False
     
+    def export_training_data(self, format='pkl'):
+        """Export training data in standardized format"""
+        try:
+            export_data = {
+                'metadata': {
+                    'export_date': datetime.now().isoformat(),
+                    'total_samples': sum(len(samples) for samples in self.training_data.values()),
+                    'format_version': '1.0',
+                    'gestures': list(self.training_data.keys())
+                },
+                'samples': self.training_data
+            }
+            
+            if format == 'pkl':
+                export_path = os.path.join(os.path.dirname(self.training_samples_path), 'training_export.pkl')
+                with open(export_path, 'wb') as f:
+                    pickle.dump(export_data, f)
+            elif format == 'json':
+                export_path = os.path.join(os.path.dirname(self.training_samples_path), 'training_export.json')
+                # Convert numpy arrays to lists for JSON serialization
+                json_data = export_data.copy()
+                for gesture, samples in json_data['samples'].items():
+                    for i, sample in enumerate(samples):
+                        if isinstance(sample['keypoints'], np.ndarray):
+                            json_data['samples'][gesture][i]['keypoints'] = sample['keypoints'].tolist()
+                
+                with open(export_path, 'w') as f:
+                    json.dump(json_data, f, indent=2)
+            else:
+                raise ValueError(f"Unsupported export format: {format}")
+            
+            logger.info(f"Training data exported to {export_path}")
+            return export_path
+            
+        except Exception as e:
+            logger.error(f"Error exporting training data: {e}")
+            return None
+    
+    # Existing methods remain the same but with improved error handling
     def initialize_model(self):
         """Load or create the gesture recognition model"""
         model_dir = os.path.dirname(self.model_path)
@@ -444,13 +550,25 @@ class AccessibilityController:
     
     def validate_settings(self, settings):
         """Validate settings before applying"""
-        # Clamp values to reasonable ranges
-        settings["sensitivity"] = max(0.1, min(3.0, settings.get("sensitivity", 1.0)))
-        settings["cursor_speed"] = max(0.5, min(5.0, settings.get("cursor_speed", 2.0)))
-        settings["scroll_speed"] = max(10, min(100, settings.get("scroll_speed", 40)))
-        settings["gesture_confidence_threshold"] = max(0.3, min(0.95, settings.get("gesture_confidence_threshold", 0.7)))
+        validated = {}
+        for key, value in settings.items():
+            if key == "sensitivity":
+                validated[key] = max(0.1, min(3.0, float(value)))
+            elif key == "cursor_speed":
+                validated[key] = max(0.5, min(5.0, float(value)))
+            elif key == "scroll_speed":
+                validated[key] = max(10, min(100, int(value)))
+            elif key == "gesture_confidence_threshold":
+                validated[key] = max(0.3, min(0.95, float(value)))
+            elif key == "gesture_hold_time":
+                validated[key] = max(0.5, min(3.0, float(value)))
+            elif key in ["voice_feedback", "voice_control", "auto_calibration", 
+                        "dark_mode", "audio_feedback", "haptic_feedback"]:
+                validated[key] = bool(value)
+            else:
+                validated[key] = value
         
-        return settings
+        return validated
     
     def save_settings(self):
         """Save user settings to file"""
@@ -464,7 +582,7 @@ class AccessibilityController:
     
     def speak(self, text):
         """Provide voice feedback (text-to-speech only)"""
-        if self.voice_enabled and self.settings.get("voice_feedback", True):
+        if self.voice_enabled and self.settings.get("voice_feedback", True) and self.voice_engine:
             try:
                 # Run TTS in separate thread to avoid blocking
                 def speak_async():
@@ -818,9 +936,15 @@ class AccessibilityController:
     
     def cleanup(self):
         """Clean up resources"""
-        if self.cap:
-            self.cap.release()
-        self.running = False
+        try:
+            if self.cap:
+                self.cap.release()
+            if hasattr(self, 'hands') and self.hands:
+                self.hands.close()
+            self.running = False
+            logger.info("Resources cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
     
     def stop_processing(self):
         """Stop the processing loop"""
