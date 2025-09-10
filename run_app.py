@@ -1,3 +1,4 @@
+# run_app.py - Update to handle Flask 2.3+
 #!/usr/bin/env python3
 import os
 import warnings
@@ -80,7 +81,8 @@ def setup_environment():
     os.environ.setdefault('REQUIRE_AUTH', 'false')
     os.environ.setdefault('AUTH_USERNAME', 'admin')
     os.environ.setdefault('AUTH_PASSWORD', 'password')
-    os.environ.setdefault('FLASK_ENV', 'production')
+    # Remove FLASK_ENV as it's deprecated
+    # os.environ.setdefault('FLASK_ENV', 'production')
     
     logger.info("Environment setup completed")
 
@@ -113,7 +115,7 @@ def main():
         else:
             logger.info("Authentication is DISABLED")
         
-        # Run the application
+        # Run the application with updated configuration
         app.run(
             host='0.0.0.0', 
             port=5000, 
@@ -133,6 +135,6 @@ def main():
     finally:
         cleanup_resources()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     exit_code = main()
     sys.exit(exit_code)

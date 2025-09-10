@@ -1,3 +1,4 @@
+# accessibility_controller.py
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -6,33 +7,26 @@ import pyautogui
 import pyttsx3
 import time
 import threading
+from typing import Optional, Dict, Any, List, Tuple, Union
 from pynput import keyboard, mouse
 from pynput.keyboard import Controller as KeyController, Key
 from pynput.mouse import Controller as MouseController, Button
 import os
 import json
 import platform
-import subprocess
 from datetime import datetime
 import pickle
-import logging
-import re
+import gc
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from logging_config import logger, log_exceptions
+from config import config_manager, SystemConfig
 
 class AccessibilityController:
     def __init__(self):
-        # Initialize MediaPipe Hands
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
-        )
-        self.mp_draw = mp.solutions.drawing_utils
+        self.config = config_manager.get_config()
+        
+        # Initialize MediaPipe Hands with error handling
+        self._initialize_mediapipe()
         
         # Screen dimensions
         self.screen_width, self.screen_height = pyautogui.size()
@@ -47,21 +41,21 @@ class AccessibilityController:
             'switch_app', 'desktop', 'task_view', 'help'
         ])
         
-        self.model = None
-        self.model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'accessibility_gesture_model.h5')
-        self.initialize_model()
+        self.model: Optional[tf.keras.Model] = None
+        self._initialize_model()
         
         # Control state
         self.current_gesture = "none"
         self.previous_gesture = "none"
-        self.gesture_start_time = 0
-        self.gesture_hold_threshold = 1.0  # seconds
+        self.gesture_start_time = 0.0
         
         # Processing state
         self.running = False
-        self.current_frame = None
+        self.current_frame: Optional[np.ndarray] = None
         self.current_results = None
-        self.cap = None
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.processing_thread: Optional[threading.Thread] = None
+        self.shutdown_event = threading.Event()
         
         # Mouse control
         self.mouse_controller = MouseController()
@@ -69,9 +63,72 @@ class AccessibilityController:
         self.cursor_mode = False
         self.dragging = False
         
-        # Voice feedback (text-to-speech only) - optional
-        self.voice_engine = None
+        # Voice feedback
+        self.voice_engine: Optional[pyttsx3.Engine] = None
         self.voice_enabled = False
+        self._initialize_voice()
+        
+        # Training state
+        self.is_training = False
+        self.training_gesture: Optional[str] = None
+        self.training_data: Dict[str, List[Dict]] = {}
+        self._load_training_data()
+        
+        # Performance monitoring
+        self.performance_stats = {
+            'fps': 0,
+            'last_update': time.time(),
+            'frame_count': 0,
+            'memory_usage': 0,
+            'avg_frame_time': 0
+        }
+
+    @log_exceptions
+    def _initialize_mediapipe(self) -> None:
+        """Initialize MediaPipe with error handling"""
+        try:
+            # Close existing instance if any
+            if hasattr(self, 'hands') and self.hands:
+                try:
+                    self.hands.close()
+                except:
+                    pass
+            
+            self.mp_hands = mp.solutions.hands
+            self.hands = self.mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                min_detection_confidence=0.7,
+                min_tracking_confidence=0.7
+            )
+            self.mp_draw = mp.solutions.drawing_utils
+            logger.info("MediaPipe initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize MediaPipe: {e}")
+            raise
+
+    @log_exceptions
+    def _initialize_model(self) -> None:
+        """Load or create the gesture recognition model"""
+        try:
+            model_dir = os.path.dirname(self.config.model_path)
+            os.makedirs(model_dir, exist_ok=True)
+            
+            if os.path.exists(self.config.model_path):
+                logger.info("Loading existing model...")
+                self.model = tf.keras.models.load_model(self.config.model_path)
+                logger.info("Model loaded successfully")
+            else:
+                logger.info("Creating new accessibility model...")
+                self.model = self._create_model()
+                self._create_dummy_training_data()
+        except Exception as e:
+            logger.error(f"Error initializing model: {e}")
+            self.model = None
+
+    @log_exceptions
+    def _initialize_voice(self) -> None:
+        """Initialize voice feedback system"""
         try:
             self.voice_engine = pyttsx3.init()
             self.voice_engine.setProperty('rate', 150)
@@ -79,390 +136,12 @@ class AccessibilityController:
             self.voice_enabled = True
             logger.info("Voice engine initialized successfully")
         except Exception as e:
-            logger.warning(f"Voice engine initialization failed (optional feature): {e}")
+            logger.warning(f"Voice engine initialization failed: {e}")
             self.voice_engine = None
             self.voice_enabled = False
-        
-        # User settings
-        self.settings = self.load_settings()
-        
-        # Gesture sequence for complex commands
-        self.gesture_sequence = []
-        self.sequence_timeout = 2.0  # seconds
-        self.last_gesture_time = time.time()
-        
-        # Media control state
-        self.media_keys = {
-            'play_pause': Key.media_play_pause,
-            'next_track': Key.media_next,
-            'prev_track': Key.media_previous,
-            'volume_up': Key.media_volume_up,
-            'volume_down': Key.media_volume_down,
-            'mute': Key.media_volume_mute
-        }
-        
-        # Browser control keys
-        self.browser_keys = {
-            'back': ('browser_back', 'chrome_back'),
-            'forward': ('browser_forward', 'chrome_forward'),
-            'new_tab': (Key.ctrl, 't'),
-            'close_tab': (Key.ctrl, 'w')
-        }
-        
-        # Training state
-        self.is_training = False
-        self.training_gesture = None
-        self.training_data = {}
-        self.training_samples_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'training_data', 'training_samples.pkl')
-        self.load_training_data()
-        
-        # Performance monitoring
-        self.performance_stats = {
-            'fps': 0,
-            'last_update': time.time(),
-            'frame_count': 0
-        }
-        
-    def get_status_for_json(self):
-        """Get status data that can be serialized to JSON"""
-        hand_detected = self.current_results and self.current_results.multi_hand_landmarks
-        hand_count = len(self.current_results.multi_hand_landmarks) if hand_detected else 0
-        
-        # Convert any numpy arrays to lists for JSON serialization
-        settings_serializable = {}
-        for key, value in self.settings.items():
-            if isinstance(value, (np.integer, np.floating)):
-                settings_serializable[key] = float(value)
-            elif isinstance(value, np.ndarray):
-                settings_serializable[key] = value.tolist()
-            else:
-                settings_serializable[key] = value
-        
-        return {
-            "running": self.running,
-            "cursor_mode": self.cursor_mode,
-            "voice_enabled": self.voice_enabled,
-            "current_gesture": self.current_gesture,
-            "hand_detected": hand_detected,
-            "hand_count": hand_count,
-            "settings": settings_serializable
-        }
 
-    # Standardized Training Data Methods
-    def load_training_data(self):
-        """Load training data from file using standardized format"""
-        training_dir = os.path.dirname(self.training_samples_path)
-        os.makedirs(training_dir, exist_ok=True)
-        
-        if os.path.exists(self.training_samples_path):
-            try:
-                with open(self.training_samples_path, 'rb') as f:
-                    data = pickle.load(f)
-                    # Convert old format to new standardized format if needed
-                    if isinstance(data, dict) and all(isinstance(samples, list) for samples in data.values()):
-                        self.training_data = data
-                        logger.info(f"Loaded {sum(len(samples) for samples in self.training_data.values())} training samples")
-                    else:
-                        logger.warning("Training data format is invalid, initializing empty data")
-                        self.training_data = {}
-            except Exception as e:
-                logger.error(f"Error loading training data: {e}")
-                # Initialize empty training data instead of crashing
-                self.training_data = {}
-        else:
-            self.training_data = {}
-            
-    def save_training_data(self):
-        """Save training data to file using standardized format"""
-        try:
-            training_dir = os.path.dirname(self.training_samples_path)
-            os.makedirs(training_dir, exist_ok=True)
-            
-            # Ensure data is in correct format before saving
-            validated_data = {}
-            for gesture, samples in self.training_data.items():
-                if gesture in self.gestures and isinstance(samples, list):
-                    validated_data[gesture] = samples
-            
-            with open(self.training_samples_path, 'wb') as f:
-                pickle.dump(validated_data, f)
-            logger.info("Training data saved successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving training data: {e}")
-            return False
-    
-    def validate_training_sample(self, keypoints):
-        """Validate a training sample meets requirements"""
-        if not isinstance(keypoints, np.ndarray):
-            return False
-        if keypoints.shape != (63,):  # 21 landmarks * 3 coordinates
-            return False
-        if np.all(keypoints == 0) or not np.any(keypoints):
-            return False
-        if np.any(np.isnan(keypoints)) or np.any(np.isinf(keypoints)):
-            return False
-        return True
-    
-    def start_training(self, gesture):
-        """Start training mode for a specific gesture"""
-        if not self.validate_gesture_name(gesture):
-            logger.warning(f"Invalid gesture name: {gesture}")
-            return False
-
-        self.is_training = True
-        self.training_gesture = gesture
-
-        # Initialize training data for this gesture if it doesn't exist
-        if gesture not in self.training_data:
-            self.training_data[gesture] = []
-
-        logger.info(f"Started training for gesture: {gesture}")
-        self.speak(f"Training {gesture.replace('_', ' ')}")
-        return True
-    
-    def capture_training_sample(self, gesture):
-        """Capture a training sample for the current gesture"""
-        if not self.is_training or gesture != self.training_gesture:
-            logger.warning("Not in training mode or gesture mismatch")
-            return 0
-        
-        if self.current_results and self.current_results.multi_hand_landmarks:
-            try:
-                # Extract keypoints from the current frame
-                keypoints = self.extract_keypoints(self.current_results)
-                
-                # Validate sample
-                if self.validate_training_sample(keypoints):
-                    # Add to training data with standardized format
-                    sample = {
-                        'keypoints': keypoints,
-                        'timestamp': datetime.now().isoformat(),
-                        'gesture': gesture,
-                        'version': '1.0'  # Standardized format version
-                    }
-                    
-                    self.training_data[gesture].append(sample)
-                    
-                    # Save training data
-                    self.save_training_data()
-                    
-                    sample_count = len(self.training_data[gesture])
-                    logger.info(f"Captured sample {sample_count} for {gesture}")
-                    
-                    return sample_count
-                else:
-                    logger.warning("Invalid sample (validation failed)")
-                    return 0
-                
-            except Exception as e:
-                logger.error(f"Error capturing training sample: {e}")
-                return 0
-        else:
-            logger.warning("No hand landmarks detected")
-            return 0
-    
-    def train_model(self):
-        """Train the model with collected samples using standardized format"""
-        try:
-            # Check if we have enough training data
-            total_samples = sum(len(samples) for samples in self.training_data.values())
-            if total_samples < 20:
-                return {
-                    "status": "error",
-                    "message": f"Not enough training data. Need at least 20 samples, have {total_samples}"
-                }
-            
-            # Prepare training data using standardized format
-            X_train = []
-            y_train = []
-            
-            for i, gesture in enumerate(self.gestures):
-                if gesture in self.training_data and self.training_data[gesture]:
-                    for sample in self.training_data[gesture]:
-                        # Ensure we have valid samples in standardized format
-                        if (self.validate_training_sample(sample['keypoints']) and 
-                            sample.get('gesture') == gesture):
-                            X_train.append(sample['keypoints'])
-                            y_train.append(i)
-            
-            if not X_train:
-                return {
-                    "status": "error",
-                    "message": "No valid training data available"
-                }
-            
-            # Convert to numpy arrays
-            X_train = np.array(X_train)
-            y_train = np.array(y_train)
-            
-            # Convert labels to categorical
-            y_train = tf.keras.utils.to_categorical(y_train, num_classes=len(self.gestures))
-            
-            # Split data (80% train, 20% validation)
-            split_idx = int(0.8 * len(X_train))
-            X_val, y_val = X_train[split_idx:], y_train[split_idx:]
-            X_train, y_train = X_train[:split_idx], y_train[:split_idx]
-            
-            logger.info(f"Training on {len(X_train)} samples, validating on {len(X_val)} samples")
-            
-            # Create a new model if none exists
-            if self.model is None:
-                self.model = self.create_model()
-            
-            # Train the model
-            history = self.model.fit(
-                X_train, y_train,
-                validation_data=(X_val, y_val),
-                epochs=50,
-                batch_size=32,
-                verbose=1,
-                callbacks=[
-                    tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-                    tf.keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=3)
-                ]
-            )
-            
-            # Get training results
-            final_accuracy = history.history['categorical_accuracy'][-1]
-            final_val_accuracy = history.history['val_categorical_accuracy'][-1]
-            final_loss = history.history['loss'][-1]
-            
-            logger.info(f"Training completed. Accuracy: {final_accuracy:.2%}, Validation Accuracy: {final_val_accuracy:.2%}")
-            
-            return {
-                "status": "success",
-                "accuracy": float(final_accuracy),
-                "val_accuracy": float(final_val_accuracy),
-                "loss": float(final_loss)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error training model: {e}")
-            return {
-                "status": "error",
-                "message": str(e)
-            }
-    
-    def save_model(self):
-        """Save the trained model to file"""
-        try:
-            if self.model is not None:
-                model_dir = os.path.dirname(self.model_path)
-                os.makedirs(model_dir, exist_ok=True)
-                self.model.save(self.model_path)
-                logger.info("Model saved successfully")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Error saving model: {e}")
-            return False
-    
-    def validate_gesture_name(self, gesture):
-        """Validate gesture name format"""
-        if not isinstance(gesture, str):
-            return False
-        if gesture not in self.gestures:
-            return False
-        # Allow only alphanumeric and underscore characters
-        if not re.match(r'^[a-zA-Z0-9_]+$', gesture):
-            return False
-        return True
-    
-    def get_training_status(self):
-        """Get training status and statistics with standardized format"""
-        total_samples = sum(len(samples) for samples in self.training_data.values())
-        current_samples = len(self.training_data[self.training_gesture]) if self.training_gesture in self.training_data else 0
-        
-        return {
-            "current_gesture": self.training_gesture,
-            "samples_collected": current_samples,
-            "total_samples": total_samples,
-            "is_training": self.is_training,
-            "gestures_trained": [g for g in self.gestures if g in self.training_data and self.training_data[g]],
-            "format_version": "1.0"
-        }
-    
-    def reset_training_data(self, gesture=None):
-        """Reset training data for a specific gesture or all gestures"""
-        try:
-            if gesture:
-                if self.validate_gesture_name(gesture) and gesture in self.training_data:
-                    self.training_data[gesture] = []
-                    logger.info(f"Reset training data for {gesture}")
-                else:
-                    return False
-            else:
-                self.training_data = {}
-                logger.info("Reset all training data")
-            
-            # Save the changes
-            return self.save_training_data()
-            
-        except Exception as e:
-            logger.error(f"Error resetting training data: {e}")
-            return False
-    
-    def export_training_data(self, format='pkl'):
-        """Export training data in standardized format"""
-        try:
-            export_data = {
-                'metadata': {
-                    'export_date': datetime.now().isoformat(),
-                    'total_samples': sum(len(samples) for samples in self.training_data.values()),
-                    'format_version': '1.0',
-                    'gestures': list(self.training_data.keys())
-                },
-                'samples': self.training_data
-            }
-            
-            if format == 'pkl':
-                export_path = os.path.join(os.path.dirname(self.training_samples_path), 'training_export.pkl')
-                with open(export_path, 'wb') as f:
-                    pickle.dump(export_data, f)
-            elif format == 'json':
-                export_path = os.path.join(os.path.dirname(self.training_samples_path), 'training_export.json')
-                # Convert numpy arrays to lists for JSON serialization
-                json_data = export_data.copy()
-                for gesture, samples in json_data['samples'].items():
-                    for i, sample in enumerate(samples):
-                        if isinstance(sample['keypoints'], np.ndarray):
-                            json_data['samples'][gesture][i]['keypoints'] = sample['keypoints'].tolist()
-                
-                with open(export_path, 'w') as f:
-                    json.dump(json_data, f, indent=2)
-            else:
-                raise ValueError(f"Unsupported export format: {format}")
-            
-            logger.info(f"Training data exported to {export_path}")
-            return export_path
-            
-        except Exception as e:
-            logger.error(f"Error exporting training data: {e}")
-            return None
-    
-    # Existing methods remain the same but with improved error handling
-    def initialize_model(self):
-        """Load or create the gesture recognition model"""
-        model_dir = os.path.dirname(self.model_path)
-        os.makedirs(model_dir, exist_ok=True)
-        
-        if os.path.exists(self.model_path):
-            try:
-                logger.info("Loading existing model...")
-                self.model = tf.keras.models.load_model(self.model_path)
-                logger.info("Model loaded successfully")
-            except Exception as e:
-                logger.error(f"Error loading model: {e}")
-                logger.info("Creating new model...")
-                self.model = self.create_model()
-                self.create_dummy_training_data()
-        else:
-            logger.info("Creating new accessibility model...")
-            self.model = self.create_model()
-            self.create_dummy_training_data()
-    
-    def create_model(self):
+    @log_exceptions
+    def _create_model(self) -> tf.keras.Model:
         """Create a new model for gesture recognition"""
         try:
             # Simple Dense model for single-frame gesture recognition
@@ -482,9 +161,10 @@ class AccessibilityController:
             return model
         except Exception as e:
             logger.error(f"Error creating model: {e}")
-            return None
-    
-    def create_dummy_training_data(self):
+            raise
+
+    @log_exceptions
+    def _create_dummy_training_data(self) -> None:
         """Create minimal training data so model can function"""
         if self.model is None:
             return
@@ -514,89 +194,307 @@ class AccessibilityController:
             # Quick training with dummy data
             logger.info("Training model with dummy data...")
             self.model.fit(X_train, y_train, epochs=10, verbose=0)
-            self.model.save(self.model_path)
+            self.model.save(self.config.model_path)
             logger.info("Model initialized with dummy data")
         except Exception as e:
             logger.error(f"Error creating dummy training data: {e}")
-    
-    def load_settings(self):
-        """Load user settings from file"""
-        default_settings = {
-            "sensitivity": 1.0,
-            "voice_feedback": True,
-            "cursor_speed": 2.0,
-            "scroll_speed": 40,
-            "zoom_sensitivity": 1.2,
-            "gesture_hold_time": 1.0,
-            "double_click_speed": 0.3,
-            "gesture_confidence_threshold": 0.7,
-            "voice_control": False,
-            "auto_calibration": True,
-            "dark_mode": False,
-            "audio_feedback": True,
-            "haptic_feedback": False
-        }
+
+    @log_exceptions
+    def _load_training_data(self) -> None:
+        """Load training data from file using standardized format"""
+        training_dir = os.path.dirname(self.config.training_data_path)
+        os.makedirs(training_dir, exist_ok=True)
         
-        try:
-            settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
-            if os.path.exists(settings_path):
-                with open(settings_path, 'r') as f:
-                    loaded_settings = json.load(f)
-                    return self.validate_settings({**default_settings, **loaded_settings})
-        except Exception as e:
-            logger.error(f"Error loading settings: {e}")
-        
-        return default_settings
-    
-    def validate_settings(self, settings):
-        """Validate settings before applying"""
-        validated = {}
-        for key, value in settings.items():
-            if key == "sensitivity":
-                validated[key] = max(0.1, min(3.0, float(value)))
-            elif key == "cursor_speed":
-                validated[key] = max(0.5, min(5.0, float(value)))
-            elif key == "scroll_speed":
-                validated[key] = max(10, min(100, int(value)))
-            elif key == "gesture_confidence_threshold":
-                validated[key] = max(0.3, min(0.95, float(value)))
-            elif key == "gesture_hold_time":
-                validated[key] = max(0.5, min(3.0, float(value)))
-            elif key in ["voice_feedback", "voice_control", "auto_calibration", 
-                        "dark_mode", "audio_feedback", "haptic_feedback"]:
-                validated[key] = bool(value)
-            else:
-                validated[key] = value
-        
-        return validated
-    
-    def save_settings(self):
-        """Save user settings to file"""
-        try:
-            settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
-            with open(settings_path, 'w') as f:
-                json.dump(self.settings, f, indent=4)
-            logger.info("Settings saved successfully")
-        except Exception as e:
-            logger.error(f"Error saving settings: {e}")
-    
-    def speak(self, text):
-        """Provide voice feedback (text-to-speech only)"""
-        if self.voice_enabled and self.settings.get("voice_feedback", True) and self.voice_engine:
+        if os.path.exists(self.config.training_data_path):
             try:
-                # Run TTS in separate thread to avoid blocking
-                def speak_async():
-                    try:
-                        self.voice_engine.say(text)
-                        self.voice_engine.runAndWait()
-                    except Exception as e:
-                        logger.error(f"Speech error: {e}")
-                
-                threading.Thread(target=speak_async, daemon=True).start()
+                with open(self.config.training_data_path, 'rb') as f:
+                    data = pickle.load(f)
+                    # Convert old format to new standardized format if needed
+                    if isinstance(data, dict) and all(isinstance(samples, list) for samples in data.values()):
+                        self.training_data = data
+                        logger.info(f"Loaded {sum(len(samples) for samples in self.training_data.values())} training samples")
+                    else:
+                        logger.warning("Training data format is invalid, initializing empty data")
+                        self.training_data = {}
             except Exception as e:
-                logger.error(f"Speech setup error: {e}")
-    
-    def mediapipe_detection(self, image):
+                logger.error(f"Error loading training data: {e}")
+                # Initialize empty training data instead of crashing
+                self.training_data = {}
+        else:
+            self.training_data = {}
+
+    @log_exceptions
+    def start_processing(self) -> bool:
+        """Start the main processing loop in a separate thread"""
+        if self.running:
+            logger.warning("Controller is already running")
+            return False
+        
+        try:
+            # Reinitialize MediaPipe if it was closed
+            if not hasattr(self, 'hands') or self.hands._graph is None:
+                self._initialize_mediapipe()
+            
+            self.shutdown_event.clear()
+            self.processing_thread = threading.Thread(
+                target=self._processing_loop,
+                daemon=True,
+                name="AccessibilityProcessor"
+            )
+            self.processing_thread.start()
+            
+            # Wait for thread to start
+            time.sleep(0.5)
+            if self.running:
+                logger.info("Accessibility controller started successfully")
+                return True
+            else:
+                logger.error("Failed to start processing thread")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error starting processing: {e}")
+            return False
+
+    @log_exceptions
+    def _processing_loop(self) -> None:
+        """Main processing loop with proper resource management"""
+        self.running = True
+        
+        try:
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                logger.error("Could not open camera")
+                self.running = False
+                return
+            
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
+            
+            logger.info("Starting Accessibility Controller processing...")
+            self.speak("Accessibility controller started")
+            
+            # Performance monitoring
+            start_time = time.time()
+            frame_count = 0
+            frame_times = []
+            
+            while self.running and not self.shutdown_event.is_set():
+                loop_start = time.time()
+                
+                # Read frame with timeout
+                ret, frame = self._read_frame_with_timeout()
+                if not ret:
+                    continue
+                
+                # Process frame
+                processed_frame = self._process_frame(frame)
+                if processed_frame is not None:
+                    self.current_frame = processed_frame
+                
+                # Performance monitoring
+                frame_count += 1
+                frame_time = time.time() - loop_start
+                frame_times.append(frame_time)
+                
+                # Update stats every second
+                if time.time() - start_time >= 1.0:
+                    self._update_performance_stats(frame_count, frame_times)
+                    frame_count = 0
+                    frame_times = []
+                    start_time = time.time()
+                
+                # Memory management
+                if frame_count % 30 == 0:
+                    self._cleanup_memory()
+                
+                # Maintain target FPS
+                self._maintain_fps(loop_start)
+                
+        except Exception as e:
+            logger.error(f"Processing loop error: {e}")
+        finally:
+            self._cleanup_resources()
+            logger.info("Processing loop stopped")
+
+    @log_exceptions
+    def _read_frame_with_timeout(self, timeout_ms: int = 1000) -> Tuple[bool, Optional[np.ndarray]]:
+        """Read frame with timeout to prevent hanging"""
+        if self.cap is None:
+            return False, None
+        
+        # Set timeout property if supported
+        if hasattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC'):
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            time.sleep(0.01)  # Brief pause before retry
+        return ret, frame
+
+    @log_exceptions
+    def _process_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Process a single frame with comprehensive error handling"""
+        try:
+            frame = cv2.flip(frame, 1)
+            image, results = self.mediapipe_detection(frame)
+            image = self.draw_landmarks(image, results)
+            
+            # Store current results for web interface
+            self.current_results = results
+            
+            # Extract keypoints and recognize gesture
+            keypoints = self.extract_keypoints(results)
+            
+            # Control cursor if in cursor mode and hand detected
+            if results and results.multi_hand_landmarks and self.cursor_mode:
+                self.control_cursor(results.multi_hand_landmarks[0])
+            
+            # Release drag if no hand detected
+            if self.dragging and (not results or not results.multi_hand_landmarks):
+                self._release_drag()
+            
+            # Recognize gesture and execute action
+            if self.model is not None and keypoints is not None:
+                gesture, confidence = self.recognize_gesture(keypoints)
+                self.current_gesture = gesture
+                
+                if gesture != "none" and confidence > 0.5:
+                    logger.debug(f"Detected: {gesture} (confidence: {confidence:.2f})")
+                
+                self.execute_gesture_action(
+                    gesture, 
+                    results.multi_hand_landmarks[0] if results and results.multi_hand_landmarks else None, 
+                    confidence
+                )
+            
+            return image
+            
+        except Exception as e:
+            logger.error(f"Frame processing error: {e}")
+            return None
+
+    @log_exceptions
+    def _update_performance_stats(self, frame_count: int, frame_times: List[float]) -> None:
+        """Update performance statistics"""
+        try:
+            if frame_times:
+                avg_fps = frame_count / (time.time() - self.performance_stats['last_update'])
+                avg_frame_time = np.mean(frame_times) * 1000  # ms
+                
+                self.performance_stats.update({
+                    'fps': avg_fps,
+                    'frame_count': frame_count,
+                    'avg_frame_time': avg_frame_time,
+                    'last_update': time.time(),
+                    'memory_usage': self._get_memory_usage()
+                })
+        except Exception as e:
+            logger.error(f"Error updating performance stats: {e}")
+
+    @log_exceptions
+    def _get_memory_usage(self) -> float:
+        """Get current memory usage in MB"""
+        try:
+            import psutil
+            process = psutil.Process()
+            return process.memory_info().rss / 1024 / 1024  # MB
+        except ImportError:
+            return 0.0
+        except Exception:
+            return 0.0
+
+    @log_exceptions
+    def _cleanup_memory(self) -> None:
+        """Clean up memory to prevent leaks"""
+        try:
+            # Force garbage collection
+            gc.collect()
+            
+            # Clear TensorFlow session if it exists
+            if hasattr(tf, 'keras'):
+                tf.keras.backend.clear_session()
+                
+        except Exception as e:
+            logger.warning(f"Memory cleanup error: {e}")
+
+    @log_exceptions
+    def _maintain_fps(self, loop_start: float) -> None:
+        """Maintain target FPS by sleeping if necessary"""
+        try:
+            elapsed = time.time() - loop_start
+            target_time = 1.0 / self.config.target_fps
+            
+            if elapsed < target_time:
+                time.sleep(target_time - elapsed)
+        except Exception as e:
+            logger.warning(f"FPS maintenance error: {e}")
+
+    @log_exceptions
+    def _release_drag(self) -> None:
+        """Release drag operation safely"""
+        try:
+            if self.dragging:
+                self.mouse_controller.release(Button.left)
+                self.dragging = False
+                logger.debug("Drag released due to hand loss")
+        except Exception as e:
+            logger.error(f"Drag release error: {e}")
+            self.dragging = False
+
+    @log_exceptions
+    def stop_processing(self) -> bool:
+        """Stop the processing loop gracefully"""
+        if not self.running:
+            return True
+        
+        logger.info("Stopping accessibility controller...")
+        self.running = False
+        self.shutdown_event.set()
+        
+        # Wait for thread to finish with timeout
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=5.0)
+            if self.processing_thread.is_alive():
+                logger.warning("Processing thread did not stop gracefully")
+        
+        self._cleanup_resources()
+        logger.info("Accessibility controller stopped")
+        return True
+
+    @log_exceptions
+    def _cleanup_resources(self) -> None:
+        """Clean up all resources but don't destroy MediaPipe permanently"""
+        try:
+            # Release camera
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            
+            # Close MediaPipe safely - but don't set to None so we can check if it exists
+            if hasattr(self, 'hands') and self.hands:
+                try:
+                    self.hands.close()
+                except Exception as e:
+                    logger.debug(f"MediaPipe cleanup warning: {e}")
+            
+            # Clear TensorFlow session
+            if hasattr(tf, 'keras'):
+                tf.keras.backend.clear_session()
+            
+            # Clear frame variables but keep other state
+            self.current_frame = None
+            self.current_results = None
+            
+            logger.info("Resources cleaned up successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        finally:
+            self.running = False
+
+    @log_exceptions
+    def mediapipe_detection(self, image: np.ndarray) -> Tuple[np.ndarray, Any]:
         """Process image with MediaPipe Hands"""
         try:
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -608,8 +506,9 @@ class AccessibilityController:
         except Exception as e:
             logger.error(f"MediaPipe detection error: {e}")
             return image, None
-    
-    def extract_keypoints(self, results):
+
+    @log_exceptions
+    def extract_keypoints(self, results: Any) -> Optional[np.ndarray]:
         """Extract hand landmarks from MediaPipe results"""
         if results and results.multi_hand_landmarks:
             try:
@@ -623,8 +522,9 @@ class AccessibilityController:
                 logger.error(f"Keypoint extraction error: {e}")
                 return np.zeros(21*3)
         return np.zeros(21*3)
-    
-    def draw_landmarks(self, image, results):
+
+    @log_exceptions
+    def draw_landmarks(self, image: np.ndarray, results: Any) -> np.ndarray:
         """Draw hand landmarks on the image"""
         if results and results.multi_hand_landmarks:
             try:
@@ -637,8 +537,9 @@ class AccessibilityController:
             except Exception as e:
                 logger.error(f"Landmark drawing error: {e}")
         return image
-    
-    def recognize_gesture(self, landmarks):
+
+    @log_exceptions
+    def recognize_gesture(self, landmarks: np.ndarray) -> Tuple[str, float]:
         """Recognize gesture from landmarks with better validation"""
         if (self.model is None or landmarks is None or 
             len(landmarks) != 63 or np.all(landmarks == 0)):
@@ -654,7 +555,7 @@ class AccessibilityController:
             confidence = prediction[predicted_class]
             
             # Only return if confidence is above threshold
-            if confidence > self.settings.get("gesture_confidence_threshold", 0.5):
+            if confidence > self.config.gesture_confidence_threshold:
                 return self.gestures[predicted_class], confidence
             else:
                 return "none", confidence
@@ -662,8 +563,9 @@ class AccessibilityController:
         except Exception as e:
             logger.error(f"Gesture recognition error: {e}")
             return "none", 0.0
-    
-    def control_cursor(self, hand_landmarks):
+
+    @log_exceptions
+    def control_cursor(self, hand_landmarks: Any) -> None:
         """Control mouse cursor with hand position"""
         if not self.cursor_mode or hand_landmarks is None:
             return
@@ -676,24 +578,26 @@ class AccessibilityController:
             
             # Move cursor with smoothing
             current_x, current_y = self.mouse_controller.position
-            new_x = current_x + (x - current_x) * 0.3 * self.settings["cursor_speed"]
-            new_y = current_y + (y - current_y) * 0.3 * self.settings["cursor_speed"]
+            new_x = current_x + (x - current_x) * 0.3 * self.config.cursor_speed
+            new_y = current_y + (y - current_y) * 0.3 * self.config.cursor_speed
             
             self.mouse_controller.position = (new_x, new_y)
         except Exception as e:
             logger.error(f"Cursor control error: {e}")
-    
-    def safe_execute_action(self, action_func, action_name="action"):
+
+    @log_exceptions
+    def safe_execute_action(self, action_func, action_name: str = "action") -> None:
         """Safely execute actions with error handling"""
         try:
             action_func()
         except Exception as e:
             logger.error(f"{action_name} execution error: {e}")
             self.speak("Action failed")
-    
-    def execute_gesture_action(self, gesture, hand_landmarks=None, confidence=0.0):
+
+    @log_exceptions
+    def execute_gesture_action(self, gesture: str, hand_landmarks: Any = None, confidence: float = 0.0) -> None:
         """Execute computer control actions based on recognized gesture"""
-        if confidence < self.settings.get("gesture_confidence_threshold", 0.7):
+        if confidence < self.config.gesture_confidence_threshold:
             return
         
         current_time = time.time()
@@ -717,9 +621,9 @@ class AccessibilityController:
                 lambda: self.mouse_controller.click(Button.left, 2) if self.cursor_mode else None, "double_click"),
             "drag": lambda: self.handle_drag(hand_landmarks),
             "scroll_up": lambda: self.safe_execute_action(
-                lambda: pyautogui.scroll(self.settings["scroll_speed"]), "scroll_up"),
+                lambda: pyautogui.scroll(self.config.scroll_speed), "scroll_up"),
             "scroll_down": lambda: self.safe_execute_action(
-                lambda: pyautogui.scroll(-self.settings["scroll_speed"]), "scroll_down"),
+                lambda: pyautogui.scroll(-self.config.scroll_speed), "scroll_down"),
             "zoom_in": lambda: self.safe_execute_action(
                 lambda: self.execute_key_combo(Key.ctrl, Key.plus), "zoom_in"),
             "zoom_out": lambda: self.safe_execute_action(
@@ -768,13 +672,21 @@ class AccessibilityController:
         
         if gesture in action_map:
             action_map[gesture]()
-    
-    def execute_browser_command(self, command):
+
+    @log_exceptions
+    def execute_browser_command(self, command: str) -> None:
         """Execute browser-specific commands with fallbacks"""
         try:
             # Try browser-specific keys first
-            if command in self.browser_keys:
-                key_combo = self.browser_keys[command]
+            browser_keys = {
+                'back': ('browser_back', 'chrome_back'),
+                'forward': ('browser_forward', 'chrome_forward'),
+                'new_tab': (Key.ctrl, 't'),
+                'close_tab': (Key.ctrl, 'w')
+            }
+            
+            if command in browser_keys:
+                key_combo = browser_keys[command]
                 if isinstance(key_combo, tuple):
                     if len(key_combo) == 2:
                         self.execute_key_combo(key_combo[0], key_combo[1])
@@ -790,16 +702,18 @@ class AccessibilityController:
                     self.execute_key_combo(Key.alt, Key.right)
         except Exception as e:
             logger.error(f"Browser command error: {e}")
-    
-    def toggle_cursor_mode(self, duration):
+
+    @log_exceptions
+    def toggle_cursor_mode(self, duration: float) -> None:
         """Toggle cursor mode with hold threshold"""
-        if duration > self.gesture_hold_threshold:
+        if duration > self.config.gesture_hold_time:
             self.cursor_mode = not self.cursor_mode
             mode = "enabled" if self.cursor_mode else "disabled"
             self.speak(f"Cursor mode {mode}")
             self.gesture_start_time = time.time()  # Reset timer
-    
-    def handle_drag(self, hand_landmarks):
+
+    @log_exceptions
+    def handle_drag(self, hand_landmarks: Any) -> None:
         """Handle drag gesture"""
         if not self.cursor_mode or not hand_landmarks:
             return
@@ -814,8 +728,9 @@ class AccessibilityController:
                 self.control_cursor(hand_landmarks)
         except Exception as e:
             logger.error(f"Drag error: {e}")
-    
-    def execute_key_combo(self, modifier, key):
+
+    @log_exceptions
+    def execute_key_combo(self, modifier: Any, key: Any) -> None:
         """Execute keyboard combinations safely"""
         try:
             if modifier:
@@ -835,8 +750,9 @@ class AccessibilityController:
                     self.key_controller.release(key)
         except Exception as e:
             logger.error(f"Key combo error: {e}")
-    
-    def emergency_stop(self):
+
+    @log_exceptions
+    def emergency_stop(self) -> None:
         """Emergency stop all actions"""
         try:
             if self.dragging:
@@ -850,120 +766,408 @@ class AccessibilityController:
             self.speak("Emergency stop activated")
         except Exception as e:
             logger.error(f"Emergency stop error: {e}")
-    
-    def show_help(self):
+
+    @log_exceptions
+    def show_help(self) -> None:
         """Show available gestures and commands"""
         help_text = "Available gestures: Cursor mode, Click, Right click, Drag, Scroll, Copy, Paste, Cut, Undo, Redo, Save, New tab, Close tab, Switch app, Desktop, Task view, Help, Media controls, Volume controls, Zoom controls"
         self.speak(help_text)
-    
-    def start_processing(self):
-        """Start the main processing loop"""
-        self.running = True
-        
-        try:
-            self.cap = cv2.VideoCapture(0)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            
-            if not self.cap.isOpened():
-                logger.error("Could not open camera")
-                return
-            
-            logger.info("Starting Accessibility Controller processing...")
-            self.speak("Accessibility controller started")
-            
-            # Performance monitoring
-            start_time = time.time()
-            frame_count = 0
-            
-            while self.running:
-                ret, frame = self.cap.read()
-                if not ret:
-                    time.sleep(0.1)
-                    continue
+
+    @log_exceptions
+    def speak(self, text: str) -> None:
+        """Provide voice feedback (text-to-speech only) with thread safety"""
+        if self.voice_enabled and self.config.voice_feedback and self.voice_engine:
+            try:
+             # Use a single speech thread to avoid run loop conflicts
+                if not hasattr(self, '_speech_thread') or not self._speech_thread.is_alive():
+                    def speak_async():
+                        try:
+                            # Stop any existing speech first
+                            self.voice_engine.stop()
+                            # Say the new text
+                            self.voice_engine.say(text)
+                            self.voice_engine.runAndWait()
+                        except Exception as e:
+                            logger.error(f"Speech error: {e}")
                 
-                frame = cv2.flip(frame, 1)
-                image, results = self.mediapipe_detection(frame)
+                    self._speech_thread = threading.Thread(target=speak_async, daemon=True)
+                    self._speech_thread.start()
+                else:
+                 # Speech is already in progress, queue this text or skip
+                 logger.debug("Speech already in progress, skipping: " + text)
                 
-                # Store current frame and results for web interface
-                self.current_frame = self.draw_landmarks(image.copy(), results)
-                self.current_results = results
-                
-                # Extract keypoints and recognize gesture
-                keypoints = self.extract_keypoints(results)
-                
-                # Control cursor if in cursor mode and hand detected
-                if results and results.multi_hand_landmarks and self.cursor_mode:
-                    self.control_cursor(results.multi_hand_landmarks[0])
-                
-                # Release drag if no hand detected
-                if self.dragging and (not results or not results.multi_hand_landmarks):
-                    try:
-                        self.mouse_controller.release(Button.left)
-                        self.dragging = False
-                    except Exception as e:
-                        logger.error(f"Drag release error: {e}")
-                
-                # Recognize gesture and execute action
-                if self.model is not None and keypoints is not None:
-                    gesture, confidence = self.recognize_gesture(keypoints)
-                    self.current_gesture = gesture
-                    
-                    # Show debug info in console
-                    if gesture != "none" and confidence > 0.5:
-                        logger.info(f"Detected: {gesture} (confidence: {confidence:.2f})")
-                    
-                    self.execute_gesture_action(gesture, 
-                                              results.multi_hand_landmarks[0] if results and results.multi_hand_landmarks else None, 
-                                              confidence)
-                
-                # Update performance stats
-                frame_count += 1
-                if time.time() - start_time >= 1.0:
-                    self.performance_stats['fps'] = frame_count
-                    self.performance_stats['last_update'] = time.time()
-                    self.performance_stats['frame_count'] = frame_count
-                    frame_count = 0
-                    start_time = time.time()
-                
-                time.sleep(0.033)  # ~30 FPS
-                
-        except Exception as e:
-            logger.error(f"Processing error: {e}")
-        finally:
-            self.cleanup()
-            self.speak("Accessibility controller stopped")
-    
-    def cleanup(self):
-        """Clean up resources"""
-        try:
-            if self.cap:
-                self.cap.release()
-            if hasattr(self, 'hands') and self.hands:
-                self.hands.close()
-            self.running = False
-            logger.info("Resources cleaned up successfully")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-    
-    def stop_processing(self):
-        """Stop the processing loop"""
-        self.running = False
-        self.cleanup()
-    
-    def get_current_frame(self):
+            except Exception as e:
+                logger.error(f"Speech setup error: {e}")
+
+    @log_exceptions
+    def get_current_frame(self) -> Optional[np.ndarray]:
         """Get current processed frame for web interface"""
         if self.current_frame is not None:
             return self.current_frame.copy()
         return None
-    
-    def get_performance_stats(self):
+
+    @log_exceptions
+    def get_performance_stats(self) -> Dict[str, Any]:
         """Get performance statistics"""
         return self.performance_stats
-    
-    def run(self):
+
+    @log_exceptions
+    def get_status(self) -> Dict[str, Any]:
+        """Get system status with data sanitization"""
+        try:
+            hand_detected = (
+                self.current_results and 
+                hasattr(self.current_results, 'multi_hand_landmarks') and 
+                self.current_results.multi_hand_landmarks
+            )
+            hand_count = len(self.current_results.multi_hand_landmarks) if hand_detected else 0
+            
+            status = {
+                "running": self.running,
+                "cursor_mode": self.cursor_mode,
+                "voice_enabled": self.voice_enabled,
+                "current_gesture": self.current_gesture,
+                "hand_detected": hand_detected,
+                "hand_count": hand_count,
+                "performance": self.performance_stats
+            }
+            
+            # Sanitize data for JSON serialization
+            return self._sanitize_for_json(status)
+            
+        except Exception as e:
+            logger.error(f"Error getting status: {e}")
+            return {"error": "Failed to get status"}
+
+    def _sanitize_for_json(self, data: Any) -> Any:
+        """Recursively sanitize data for JSON serialization"""
+        if isinstance(data, (str, int, float, bool, type(None))):
+            return data
+        elif isinstance(data, dict):
+            return {k: self._sanitize_for_json(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self._sanitize_for_json(item) for item in data]
+        elif isinstance(data, np.integer):
+            return int(data)
+        elif isinstance(data, np.floating):
+            return float(data)
+        elif isinstance(data, np.ndarray):
+            return data.tolist()
+        elif hasattr(data, '__dict__'):
+            return self._sanitize_for_json(data.__dict__)
+        else:
+            return str(data)
+
+    # Training methods
+    @log_exceptions
+    def validate_gesture_name(self, gesture: str) -> bool:
+        """Validate gesture name format"""
+        if not isinstance(gesture, str):
+            return False
+        if gesture not in self.gestures:
+            return False
+        # Allow only alphanumeric and underscore characters
+        import re
+        if not re.match(r'^[a-zA-Z0-9_]+$', gesture):
+            return False
+        return True
+
+    @log_exceptions
+    def validate_training_sample(self, keypoints: np.ndarray) -> bool:
+        """Validate a training sample meets requirements"""
+        if keypoints is None or not isinstance(keypoints, np.ndarray):
+            return False
+        if keypoints.shape != (63,):  # 21 landmarks * 3 coordinates
+            return False
+        if np.all(keypoints == 0) or not np.any(keypoints):
+            return False
+        if np.any(np.isnan(keypoints)) or np.any(np.isinf(keypoints)):
+            return False
+        return True
+
+    @log_exceptions
+    def start_training(self, gesture: str) -> bool:
+        """Start training mode for a specific gesture"""
+        if not self.validate_gesture_name(gesture):
+            logger.warning(f"Invalid gesture name: {gesture}")
+            return False
+
+        self.is_training = True
+        self.training_gesture = gesture
+
+        # Initialize training data for this gesture if it doesn't exist
+        if gesture not in self.training_data:
+            self.training_data[gesture] = []
+
+        logger.info(f"Started training for gesture: {gesture}")
+        self.speak(f"Training {gesture.replace('_', ' ')}")
+        return True
+
+    @log_exceptions
+    def capture_training_sample(self, gesture: str) -> int:
+        """Capture a training sample for the current gesture"""
+        if not self.is_training or gesture != self.training_gesture:
+            logger.warning("Not in training mode or gesture mismatch")
+            return 0
+        
+        if self.current_results and self.current_results.multi_hand_landmarks:
+            try:
+                # Extract keypoints from the current frame
+                keypoints = self.extract_keypoints(self.current_results)
+                
+                # Validate sample
+                if self.validate_training_sample(keypoints):
+                    # Add to training data with standardized format
+                    sample = {
+                        'keypoints': keypoints,
+                        'timestamp': datetime.now().isoformat(),
+                        'gesture': gesture,
+                        'version': '1.0'  # Standardized format version
+                    }
+                    
+                    self.training_data[gesture].append(sample)
+                    
+                    # Save training data
+                    self.save_training_data()
+                    
+                    sample_count = len(self.training_data[gesture])
+                    logger.info(f"Captured sample {sample_count} for {gesture}")
+                    
+                    return sample_count
+                else:
+                    logger.warning("Invalid sample (validation failed)")
+                    return 0
+                
+            except Exception as e:
+                logger.error(f"Error capturing training sample: {e}")
+                return 0
+        else:
+            logger.warning("No hand landmarks detected")
+            return 0
+
+    @log_exceptions
+    def save_training_data(self) -> bool:
+        """Save training data to file using standardized format"""
+        try:
+            training_dir = os.path.dirname(self.config.training_data_path)
+            os.makedirs(training_dir, exist_ok=True)
+            
+            # Ensure data is in correct format before saving
+            validated_data = {}
+            for gesture, samples in self.training_data.items():
+                if gesture in self.gestures and isinstance(samples, list):
+                    validated_data[gesture] = samples
+            
+            with open(self.config.training_data_path, 'wb') as f:
+                pickle.dump(validated_data, f)
+            logger.info("Training data saved successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving training data: {e}")
+            return False
+        
+        
+    @log_exceptions
+    def restart_processing(self) -> bool:
+        """Restart the processing loop with fresh MediaPipe instance"""
+        self.stop_processing()
+        time.sleep(1.0)  # Give time for cleanup
+        
+        # Force reinitialization of MediaPipe
+        if hasattr(self, 'hands'):
+            try:
+                self.hands.close()
+            except:
+                pass
+            del self.hands
+        
+        # Reinitialize MediaPipe
+        self._initialize_mediapipe()
+        
+        return self.start_processing()   
+
+    @log_exceptions
+    def train_model(self) -> Dict[str, Any]:
+        """Train the model with collected samples using standardized format"""
+        try:
+            # Check if we have enough training data
+            total_samples = sum(len(samples) for samples in self.training_data.values())
+            if total_samples < 20:
+                return {
+                    "status": "error",
+                    "message": f"Not enough training data. Need at least 20 samples, have {total_samples}"
+                }
+            
+            # Prepare training data using standardized format
+            X_train = []
+            y_train = []
+            
+            for i, gesture in enumerate(self.gestures):
+                if gesture in self.training_data and self.training_data[gesture]:
+                    for sample in self.training_data[gesture]:
+                        # Ensure we have valid samples in standardized format
+                        if (self.validate_training_sample(sample['keypoints']) and 
+                            sample.get('gesture') == gesture):
+                            X_train.append(sample['keypoints'])
+                            y_train.append(i)
+            
+            if not X_train:
+                return {
+                    "status": "error",
+                    "message": "No valid training data available"
+                }
+            
+            # Convert to numpy arrays
+            X_train = np.array(X_train)
+            y_train = np.array(y_train)
+            
+            # Convert labels to categorical
+            y_train = tf.keras.utils.to_categorical(y_train, num_classes=len(self.gestures))
+            
+            # Split data (80% train, 20% validation)
+            split_idx = int(0.8 * len(X_train))
+            X_val, y_val = X_train[split_idx:], y_train[split_idx:]
+            X_train, y_train = X_train[:split_idx], y_train[:split_idx]
+            
+            logger.info(f"Training on {len(X_train)} samples, validating on {len(X_val)} samples")
+            
+            # Create a new model if none exists
+            if self.model is None:
+                self.model = self._create_model()
+            
+            # Train the model
+            history = self.model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=50,
+                batch_size=32,
+                verbose=1,
+                callbacks=[
+                    tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+                    tf.keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=3)
+                ]
+            )
+            
+            # Get training results
+            final_accuracy = history.history['categorical_accuracy'][-1]
+            final_val_accuracy = history.history['val_categorical_accuracy'][-1]
+            final_loss = history.history['loss'][-1]
+            
+            logger.info(f"Training completed. Accuracy: {final_accuracy:.2%}, Validation Accuracy: {final_val_accuracy:.2%}")
+            
+            return {
+                "status": "success",
+                "accuracy": float(final_accuracy),
+                "val_accuracy": float(final_val_accuracy),
+                "loss": float(final_loss)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error training model: {e}")
+            return {
+                "status": "error",
+                "message": str(e)
+            }
+
+    @log_exceptions
+    def save_model(self) -> bool:
+        """Save the trained model to file"""
+        try:
+            if self.model is not None:
+                model_dir = os.path.dirname(self.config.model_path)
+                os.makedirs(model_dir, exist_ok=True)
+                self.model.save(self.config.model_path)
+                logger.info("Model saved successfully")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error saving model: {e}")
+            return False
+
+    @log_exceptions
+    def get_training_status(self) -> Dict[str, Any]:
+        """Get training status and statistics with standardized format"""
+        total_samples = sum(len(samples) for samples in self.training_data.values())
+        current_samples = len(self.training_data[self.training_gesture]) if self.training_gesture in self.training_data else 0
+        
+        return {
+            "current_gesture": self.training_gesture,
+            "samples_collected": current_samples,
+            "total_samples": total_samples,
+            "is_training": self.is_training,
+            "gestures_trained": [g for g in self.gestures if g in self.training_data and self.training_data[g]],
+            "format_version": "1.0"
+        }
+
+    @log_exceptions
+    def reset_training_data(self, gesture: Optional[str] = None) -> bool:
+        """Reset training data for a specific gesture or all gestures"""
+        try:
+            if gesture:
+                if self.validate_gesture_name(gesture) and gesture in self.training_data:
+                    self.training_data[gesture] = []
+                    logger.info(f"Reset training data for {gesture}")
+                else:
+                    return False
+            else:
+                self.training_data = {}
+                logger.info("Reset all training data")
+            
+            # Save the changes
+            return self.save_training_data()
+            
+        except Exception as e:
+            logger.error(f"Error resetting training data: {e}")
+            return False
+
+    @log_exceptions
+    def export_training_data(self, format: str = 'pkl') -> Optional[str]:
+        """Export training data in standardized format"""
+        try:
+            export_data = {
+                'metadata': {
+                    'export_date': datetime.now().isoformat(),
+                    'total_samples': sum(len(samples) for samples in self.training_data.values()),
+                    'format_version': '1.0',
+                    'gestures': list(self.training_data.keys())
+                },
+                'samples': self.training_data
+            }
+            
+            if format == 'pkl':
+                export_path = os.path.join(os.path.dirname(self.config.training_data_path), 'training_export.pkl')
+                with open(export_path, 'wb') as f:
+                    pickle.dump(export_data, f)
+            elif format == 'json':
+                export_path = os.path.join(os.path.dirname(self.config.training_data_path), 'training_export.json')
+                # Convert numpy arrays to lists for JSON serialization
+                json_data = export_data.copy()
+                for gesture, samples in json_data['samples'].items():
+                    for i, sample in enumerate(samples):
+                        if isinstance(sample['keypoints'], np.ndarray):
+                            json_data['samples'][gesture][i]['keypoints'] = sample['keypoints'].tolist()
+                
+                with open(export_path, 'w') as f:
+                    json.dump(json_data, f, indent=2)
+            else:
+                raise ValueError(f"Unsupported export format: {format}")
+            
+            logger.info(f"Training data exported to {export_path}")
+            return export_path
+            
+        except Exception as e:
+            logger.error(f"Error exporting training data: {e}")
+            return None
+
+    @log_exceptions
+    def run(self) -> None:
         """Legacy method for compatibility - use start_processing instead"""
         self.start_processing()
+
+    @log_exceptions
+    def cleanup_resources(self) -> None:
+        """Public method to cleanup resources"""
+        self._cleanup_resources()
 
 # Main execution
 if __name__ == "__main__":
@@ -972,4 +1176,7 @@ if __name__ == "__main__":
         controller.start_processing()
     except KeyboardInterrupt:
         logger.info("Stopping controller...")
+        controller.stop_processing()
+    except Exception as e:
+        logger.error(f"Controller error: {e}")
         controller.stop_processing()
