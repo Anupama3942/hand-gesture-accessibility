@@ -31,10 +31,8 @@ A comprehensive hands-free computer control system using hand gestures and voice
 1. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
-   
-## Installation
 
-1. Clone the repository:
+2. Clone the repository:
 ```bash
 git clone https://github.com/yourusername/hand-gesture-accessibility.git
 cd hand-gesture-accessibility
