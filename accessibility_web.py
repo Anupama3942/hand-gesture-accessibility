@@ -19,7 +19,9 @@ app.secret_key = config_manager.get_config().secret_key
 
 app.config.update(
     DEBUG=False,
-    ENV='production'
+    ENV='production',
+    PERMANENT_SESSION_LIFETIME=1800,  # 30 minutes
+    SESSION_REFRESH_EACH_REQUEST=True
 )
 
 controller = AccessibilityController()
@@ -53,12 +55,31 @@ def requires_auth(f):
     return decorated
 
 def _validate_session() -> bool:
-    """Validate session integrity"""
+    """Validate session integrity with timeout check"""
     try:
-        # Add session validation logic here
-        return session.get('authenticated', False)
+        if not session.get('authenticated', False):
+            return False
+        
+        # Check session expiration
+        login_time = session.get('login_time')
+        if login_time and time.time() - login_time > 1800:  # 30 minutes
+            session.clear()
+            return False
+            
+        return True
     except Exception:
         return False
+
+@app.before_request
+def check_session_timeout():
+    """Check session timeout before each request"""
+    if session.get('authenticated') and not _validate_session():
+        session.clear()
+        return jsonify({
+            "status": "error",
+            "message": "Session expired",
+            "code": "SESSION_EXPIRED"
+        }), 401
 
 # Enhanced input validation
 def validate_gesture_name(gesture: str) -> bool:
@@ -430,7 +451,7 @@ def start_controller():
     try:
         if not is_running:
             # Reinitialize controller if needed
-            if hasattr(controller, 'hands') and (not controller.hands or controller.hands._graph is None):
+            if hasattr(controller, 'hands') and (not controller.hands or (hasattr(controller.hands, '_graph') and controller.hands._graph is None)):
                 logger.info("Reinitializing MediaPipe for controller restart...")
                 controller._initialize_mediapipe()
             

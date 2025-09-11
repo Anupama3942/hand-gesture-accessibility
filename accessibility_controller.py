@@ -67,6 +67,7 @@ class AccessibilityController:
         self.voice_engine: Optional[pyttsx3.Engine] = None
         self.voice_enabled = False
         self._initialize_voice()
+        self._speech_lock = threading.Lock()
         
         # Training state
         self.is_training = False
@@ -85,15 +86,28 @@ class AccessibilityController:
 
     @log_exceptions
     def _initialize_mediapipe(self) -> None:
-        """Initialize MediaPipe with error handling"""
+        """Initialize MediaPipe with proper cleanup and error handling"""
         try:
-            # Close existing instance if any
-            if hasattr(self, 'hands') and self.hands:
+            # Clean up existing instance completely
+            if hasattr(self, 'hands'):
                 try:
                     self.hands.close()
                 except:
                     pass
+                # Remove the attribute to force fresh initialization
+                if hasattr(self, 'hands'):
+                    delattr(self, 'hands')
             
+            if hasattr(self, 'mp_hands'):
+                delattr(self, 'mp_hands')
+            
+            if hasattr(self, 'mp_draw'):
+                delattr(self, 'mp_draw')
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Fresh initialization
             self.mp_hands = mp.solutions.hands
             self.hands = self.mp_hands.Hands(
                 static_image_mode=False,
@@ -105,6 +119,8 @@ class AccessibilityController:
             logger.info("MediaPipe initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize MediaPipe: {e}")
+            # Set to None to indicate initialization failure
+            self.hands = None
             raise
 
     @log_exceptions
@@ -232,7 +248,7 @@ class AccessibilityController:
         
         try:
             # Reinitialize MediaPipe if it was closed
-            if not hasattr(self, 'hands') or self.hands._graph is None:
+            if not hasattr(self, 'hands') or self.hands is None or (hasattr(self.hands, '_graph') and self.hands._graph is None):
                 self._initialize_mediapipe()
             
             self.shutdown_event.clear()
@@ -319,18 +335,32 @@ class AccessibilityController:
 
     @log_exceptions
     def _read_frame_with_timeout(self, timeout_ms: int = 1000) -> Tuple[bool, Optional[np.ndarray]]:
-        """Read frame with timeout to prevent hanging"""
+        """Read frame with timeout to prevent hanging - cross-platform implementation"""
         if self.cap is None:
             return False, None
         
-        # Set timeout property if supported
-        if hasattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC'):
-            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
-        
-        ret, frame = self.cap.read()
-        if not ret:
-            time.sleep(0.01)  # Brief pause before retry
-        return ret, frame
+        # Implementation for different platforms
+        try:
+            # Try setting timeout if supported
+            if hasattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC'):
+                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+            elif hasattr(cv2, 'CAP_PROP_TIMEOUT_MSEC'):
+                self.cap.set(cv2.CAP_PROP_TIMEOUT_MSEC, timeout_ms)
+            
+            ret, frame = self.cap.read()
+            
+            # Fallback: if no timeout support, implement manual timeout
+            if not ret and timeout_ms > 0:
+                start_time = time.time()
+                while not ret and (time.time() - start_time) * 1000 < timeout_ms:
+                    time.sleep(0.01)
+                    ret, frame = self.cap.read()
+            
+            return ret, frame
+            
+        except Exception as e:
+            logger.error(f"Frame reading error: {e}")
+            return False, None
 
     @log_exceptions
     def _process_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
@@ -775,29 +805,30 @@ class AccessibilityController:
 
     @log_exceptions
     def speak(self, text: str) -> None:
-        """Provide voice feedback (text-to-speech only) with thread safety"""
-        if self.voice_enabled and self.config.voice_feedback and self.voice_engine:
+        """Provide voice feedback with proper thread safety"""
+        if not self.voice_enabled or not self.config.voice_feedback or not self.voice_engine:
+            return
+        
+        try:
+            # Use a lock to ensure thread safety
+            with self._speech_lock:
+                # Stop any ongoing speech
+                try:
+                    self.voice_engine.stop()
+                except:
+                    pass
+                
+                # Say new text
+                self.voice_engine.say(text)
+                self.voice_engine.runAndWait()
+                
+        except Exception as e:
+            logger.error(f"Speech error: {e}")
+            # Try to reinitialize voice engine on failure
             try:
-             # Use a single speech thread to avoid run loop conflicts
-                if not hasattr(self, '_speech_thread') or not self._speech_thread.is_alive():
-                    def speak_async():
-                        try:
-                            # Stop any existing speech first
-                            self.voice_engine.stop()
-                            # Say the new text
-                            self.voice_engine.say(text)
-                            self.voice_engine.runAndWait()
-                        except Exception as e:
-                            logger.error(f"Speech error: {e}")
-                
-                    self._speech_thread = threading.Thread(target=speak_async, daemon=True)
-                    self._speech_thread.start()
-                else:
-                 # Speech is already in progress, queue this text or skip
-                 logger.debug("Speech already in progress, skipping: " + text)
-                
-            except Exception as e:
-                logger.error(f"Speech setup error: {e}")
+                self._initialize_voice()
+            except:
+                self.voice_enabled = False
 
     @log_exceptions
     def get_current_frame(self) -> Optional[np.ndarray]:
@@ -874,7 +905,7 @@ class AccessibilityController:
 
     @log_exceptions
     def validate_training_sample(self, keypoints: np.ndarray) -> bool:
-        """Validate a training sample meets requirements"""
+        """Validate a training sample meets requirements with comprehensive checks"""
         if keypoints is None or not isinstance(keypoints, np.ndarray):
             return False
         if keypoints.shape != (63,):  # 21 landmarks * 3 coordinates
@@ -883,6 +914,15 @@ class AccessibilityController:
             return False
         if np.any(np.isnan(keypoints)) or np.any(np.isinf(keypoints)):
             return False
+        
+        # Relaxed validation: check if values are within reasonable range
+        if np.any(keypoints < -10.0) or np.any(keypoints > 10.0):
+            return False
+        
+        # Check for sufficient variation (not all points clustered together)
+        if np.std(keypoints) < 0.001:
+            return False
+        
         return True
 
     @log_exceptions
@@ -979,7 +1019,8 @@ class AccessibilityController:
                 self.hands.close()
             except:
                 pass
-            del self.hands
+            if hasattr(self, 'hands'):
+                del self.hands
         
         # Reinitialize MediaPipe
         self._initialize_mediapipe()
@@ -988,38 +1029,44 @@ class AccessibilityController:
 
     @log_exceptions
     def train_model(self) -> Dict[str, Any]:
-        """Train the model with collected samples using standardized format"""
+        """Train the model with collected samples using standardized format with validation"""
         try:
-            # Check if we have enough training data
-            total_samples = sum(len(samples) for samples in self.training_data.values())
-            if total_samples < 20:
-                return {
-                    "status": "error",
-                    "message": f"Not enough training data. Need at least 20 samples, have {total_samples}"
-                }
-            
-            # Prepare training data using standardized format
-            X_train = []
-            y_train = []
+            # Comprehensive data validation
+            valid_samples = []
+            valid_labels = []
             
             for i, gesture in enumerate(self.gestures):
                 if gesture in self.training_data and self.training_data[gesture]:
                     for sample in self.training_data[gesture]:
-                        # Ensure we have valid samples in standardized format
+                        # Enhanced validation
                         if (self.validate_training_sample(sample['keypoints']) and 
-                            sample.get('gesture') == gesture):
-                            X_train.append(sample['keypoints'])
-                            y_train.append(i)
+                            sample.get('gesture') == gesture and
+                            'timestamp' in sample and
+                            sample.get('version') == '1.0'):
+                            
+                            valid_samples.append(sample['keypoints'])
+                            valid_labels.append(i)
             
-            if not X_train:
+            total_samples = len(valid_samples)
+            if total_samples < 10:  # Reduced from 20 to 10 for better usability
                 return {
                     "status": "error",
-                    "message": "No valid training data available"
+                    "message": f"Not enough valid training data. Need at least 10 samples, have {total_samples}"
+                }
+            
+            # Check class distribution
+            unique_labels, counts = np.unique(valid_labels, return_counts=True)
+            min_samples = np.min(counts) if len(counts) > 0 else 0
+            
+            if min_samples < 3:  # Reduced from 5 to 3 for better usability
+                return {
+                    "status": "error",
+                    "message": f"Some gestures have too few samples. Minimum samples per gesture: 3"
                 }
             
             # Convert to numpy arrays
-            X_train = np.array(X_train)
-            y_train = np.array(y_train)
+            X_train = np.array(valid_samples)
+            y_train = np.array(valid_labels)
             
             # Convert labels to categorical
             y_train = tf.keras.utils.to_categorical(y_train, num_classes=len(self.gestures))

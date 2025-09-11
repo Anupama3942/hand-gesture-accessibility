@@ -169,7 +169,7 @@
         display: flex;
         justify-content: space-between;
         margin-bottom: 5px;
-      }
+  }
 
       .progress-bar {
         height: 20px;
@@ -403,6 +403,7 @@
         font-weight: bold;
         cursor: pointer;
         margin-top: 10px;
+        display: none;
       }
 
       .error-message {
@@ -494,7 +495,7 @@
       </div>
 
       <!-- Main Content (hidden until authenticated) -->
-      <div id="main-content">
+      <div id="main-content" style="display: none">
         <div class="training-container">
           <div class="video-section">
             <!-- Use the Flask video feed instead of direct camera access -->
@@ -655,7 +656,7 @@
               <div class="instruction-step">
                 <div class="step-number">5</div>
                 <div>
-                  Collect at least 20 samples per gesture for good accuracy
+                  Collect at least 10 samples per gesture for good accuracy
                 </div>
               </div>
               <div class="instruction-step">
@@ -944,10 +945,19 @@
           }
 
           try {
-            const data = await apiCall("/capture_sample", {
+            const response = await fetch("/capture_sample", {
               method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
               body: JSON.stringify({ gesture: currentGesture }),
             });
+
+            if (!response.ok) {
+              throw new Error("Failed to capture sample");
+            }
+
+            const data = await response.json();
 
             // Update UI with sample count
             document.getElementById("samples-collected").textContent =
@@ -1007,7 +1017,7 @@
             "training-status status-ready";
 
           // Enable train model button if we have enough samples
-          if (totalSamples >= 20) {
+          if (totalSamples >= 10) {
             document.getElementById("train-model-btn").disabled = false;
           }
 
@@ -1020,9 +1030,9 @@
 
       // Train the model
       async function trainModel() {
-        if (totalSamples < 20) {
+        if (totalSamples < 10) {
           showAlert(
-            "Please collect at least 20 samples before training.",
+            "Please collect at least 10 samples before training.",
             "error"
           );
           return;
@@ -1031,7 +1041,7 @@
         document.getElementById("training-status").textContent =
           "Training model... This may take a few minutes.";
         document.getElementById("training-status").className =
-          "training-status status-waiting";
+            "training-status status-waiting";
         document.getElementById("train-model-btn").disabled = true;
 
         try {
@@ -1138,13 +1148,13 @@
             } else {
               showAlert("Failed to reset training data.", "error");
             }
-          } catch (error) {
-            console.error("Error resetting training:", error);
-            showAlert(
-              "Error resetting training data. Please try again.",
-              "error"
-            );
-          }
+            } catch (error) {
+                console.error("Error resetting training:", error);
+                showAlert(
+                "Error resetting training data. Please try again.",
+                "error"
+                );
+            }
         }
       }
 
@@ -1255,7 +1265,7 @@
               !currentGesture || isTraining;
             document.getElementById("stop-training-btn").disabled = !isTraining;
             document.getElementById("train-model-btn").disabled =
-              totalSamples < 20;
+              totalSamples < 10;
 
             // Update training status text
             if (isTraining) {

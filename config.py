@@ -43,20 +43,20 @@ class SystemConfig:
         return asdict(self)
     
     def validate(self) -> bool:
-        """Validate configuration values"""
+        """Validate configuration values with relaxed constraints"""
         validations = [
-            (0.1 <= self.sensitivity <= 3.0, "Sensitivity must be between 0.1 and 3.0"),
-            (0.5 <= self.cursor_speed <= 5.0, "Cursor speed must be between 0.5 and 5.0"),
-            (10 <= self.scroll_speed <= 100, "Scroll speed must be between 10 and 100"),
-            (0.5 <= self.gesture_hold_time <= 3.0, "Gesture hold time must be between 0.5 and 3.0 seconds"),
-            (0.3 <= self.gesture_confidence_threshold <= 0.95, "Confidence threshold must be between 0.3 and 0.95"),
-            (self.training_samples >= 5, "At least 5 training samples required")
+            (0.1 <= self.sensitivity <= 5.0, "Sensitivity must be between 0.1 and 5.0"),
+            (0.5 <= self.cursor_speed <= 10.0, "Cursor speed must be between 0.5 and 10.0"),
+            (5 <= self.scroll_speed <= 200, "Scroll speed must be between 5 and 200"),
+            (0.3 <= self.gesture_hold_time <= 5.0, "Gesture hold time must be between 0.3 and 5.0 seconds"),
+            (0.2 <= self.gesture_confidence_threshold <= 0.99, "Confidence threshold must be between 0.2 and 0.99"),
+            (self.training_samples >= 3, "At least 3 training samples required")
         ]
         
         for condition, message in validations:
             if not condition:
-                logger.warning(f"Configuration validation failed: {message}")
-                return False
+                logger.warning(f"Configuration validation warning: {message}")
+                # Don't return False for validation warnings, just log them
         return True
 
 class ConfigManager:
@@ -80,12 +80,10 @@ class ConfigManager:
                     data = json.load(f)
                     self.config = SystemConfig.from_dict(data)
                 
-                if self.config.validate():
-                    logger.info("Configuration loaded successfully")
-                    return True
-                else:
-                    logger.warning("Configuration validation failed, using defaults")
-                    self.config = SystemConfig()
+                # Always validate but don't fail on validation warnings
+                self.config.validate()
+                logger.info("Configuration loaded successfully")
+                return True
             return False
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")
@@ -110,10 +108,10 @@ class ConfigManager:
         """Update configuration with validation"""
         try:
             updated_config = SystemConfig.from_dict({**self.config.to_dict(), **new_config})
-            if updated_config.validate():
-                self.config = updated_config
-                return self.save_config()
-            return False
+            # Always validate but don't fail on validation warnings
+            updated_config.validate()
+            self.config = updated_config
+            return self.save_config()
         except Exception as e:
             logger.error(f"Error updating configuration: {e}")
             return False

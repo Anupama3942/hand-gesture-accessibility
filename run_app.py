@@ -28,8 +28,7 @@ except ImportError:
 # Suppress TensorFlow warnings and logs
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU usage
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Even more aggressive suppression
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduced from 3 to 2 to see important warnings
 
 # Filter out specific warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -81,8 +80,6 @@ def setup_environment():
     os.environ.setdefault('REQUIRE_AUTH', 'false')
     os.environ.setdefault('AUTH_USERNAME', 'admin')
     os.environ.setdefault('AUTH_PASSWORD', 'password')
-    # Remove FLASK_ENV as it's deprecated
-    # os.environ.setdefault('FLASK_ENV', 'production')
     
     logger.info("Environment setup completed")
 

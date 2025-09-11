@@ -14,3 +14,6 @@ pynput==1.7.6
 flask==2.2.5
 speechrecognition==3.10.0
 pyaudio==0.2.13
+
+# Additional utilities
+psutil==5.9.5
