@@ -1,4 +1,4 @@
-# accessibility_controller.py
+# accessibility_controller.py - Combined improved version
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -17,6 +17,8 @@ import platform
 from datetime import datetime
 import pickle
 import gc
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 
 from logging_config import logger, log_exceptions
 from config import config_manager, SystemConfig
@@ -42,6 +44,7 @@ class AccessibilityController:
         ])
         
         self.model: Optional[tf.keras.Model] = None
+        self.scaler: Optional[StandardScaler] = None
         self._initialize_model()
         
         # Control state
@@ -119,7 +122,6 @@ class AccessibilityController:
             logger.info("MediaPipe initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize MediaPipe: {e}")
-            # Set to None to indicate initialization failure
             self.hands = None
             raise
 
@@ -134,13 +136,87 @@ class AccessibilityController:
                 logger.info("Loading existing model...")
                 self.model = tf.keras.models.load_model(self.config.model_path)
                 logger.info("Model loaded successfully")
+                
+                # Try to load scaler
+                scaler_path = self.config.model_path.replace('.h5', '_scaler.pkl')
+                if os.path.exists(scaler_path):
+                    with open(scaler_path, 'rb') as f:
+                        self.scaler = pickle.load(f)
+                    logger.info("Scaler loaded successfully")
+                else:
+                    logger.warning("Scaler not found, creating new one")
+                    self.scaler = StandardScaler()
             else:
                 logger.info("Creating new accessibility model...")
-                self.model = self._create_model()
-                self._create_dummy_training_data()
+                self.model = self._create_improved_model()
+                self.scaler = StandardScaler()
+                # Don't create dummy data - let user train properly
+                logger.info("Model created. Please train with real gestures.")
         except Exception as e:
             logger.error(f"Error initializing model: {e}")
             self.model = None
+            self.scaler = None
+
+    @log_exceptions
+    def _create_improved_model(self) -> tf.keras.Model:
+        """Create an improved model for gesture recognition"""
+        try:
+            # Improved model architecture with regularization
+            model = tf.keras.Sequential([
+                tf.keras.layers.Dense(256, activation='relu', input_shape=(63,)),
+                tf.keras.layers.BatchNormalization(),
+                tf.keras.layers.Dropout(0.3),
+                
+                tf.keras.layers.Dense(128, activation='relu'),
+                tf.keras.layers.BatchNormalization(),
+                tf.keras.layers.Dropout(0.4),
+                
+                tf.keras.layers.Dense(64, activation='relu'),
+                tf.keras.layers.BatchNormalization(),
+                tf.keras.layers.Dropout(0.3),
+                
+                tf.keras.layers.Dense(32, activation='relu'),
+                tf.keras.layers.Dropout(0.2),
+                
+                tf.keras.layers.Dense(len(self.gestures), activation='softmax')
+            ])
+            
+            # Use a lower learning rate and better optimizer
+            optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+            model.compile(
+                optimizer=optimizer, 
+                loss='categorical_crossentropy', 
+                metrics=['categorical_accuracy']
+            )
+            return model
+        except Exception as e:
+            logger.error(f"Error creating model: {e}")
+            raise
+
+    @log_exceptions
+    def normalize_landmarks(self, landmarks: np.ndarray) -> np.ndarray:
+        """Normalize hand landmarks for better training"""
+        if landmarks is None or len(landmarks) != 63:
+            return landmarks
+        
+        # Reshape to (21, 3) for processing
+        landmarks_2d = landmarks.reshape(21, 3)
+        
+        # Get wrist position (landmark 0) as reference
+        wrist = landmarks_2d[0]
+        
+        # Translate all points relative to wrist
+        normalized = landmarks_2d - wrist
+        
+        # Scale by hand size (distance from wrist to middle finger tip)
+        middle_finger_tip = normalized[12]  # landmark 12
+        hand_size = np.linalg.norm(middle_finger_tip)
+        
+        if hand_size > 0.01:  # Avoid division by very small numbers
+            normalized = normalized / hand_size
+        
+        # Flatten back to 63 features
+        return normalized.flatten()
 
     @log_exceptions
     def _initialize_voice(self) -> None:
@@ -155,65 +231,6 @@ class AccessibilityController:
             logger.warning(f"Voice engine initialization failed: {e}")
             self.voice_engine = None
             self.voice_enabled = False
-
-    @log_exceptions
-    def _create_model(self) -> tf.keras.Model:
-        """Create a new model for gesture recognition"""
-        try:
-            # Simple Dense model for single-frame gesture recognition
-            model = tf.keras.Sequential([
-                tf.keras.layers.Dense(128, activation='relu', input_shape=(63,)),
-                tf.keras.layers.Dropout(0.3),
-                tf.keras.layers.Dense(64, activation='relu'),
-                tf.keras.layers.Dropout(0.3),
-                tf.keras.layers.Dense(32, activation='relu'),
-                tf.keras.layers.Dropout(0.2),
-                tf.keras.layers.Dense(len(self.gestures), activation='softmax')
-            ])
-            
-            model.compile(optimizer='adam', 
-                         loss='categorical_crossentropy', 
-                         metrics=['categorical_accuracy'])
-            return model
-        except Exception as e:
-            logger.error(f"Error creating model: {e}")
-            raise
-
-    @log_exceptions
-    def _create_dummy_training_data(self) -> None:
-        """Create minimal training data so model can function"""
-        if self.model is None:
-            return
-            
-        try:
-            # Create dummy data for each gesture
-            dummy_data = []
-            dummy_labels = []
-            
-            for i, gesture in enumerate(self.gestures):
-                # Create 5 dummy samples per gesture
-                for _ in range(5):
-                    # Create realistic hand landmark data
-                    if gesture == "none":
-                        # Random noise for "none" gesture
-                        dummy_sample = np.random.normal(0.5, 0.2, 63)
-                    else:
-                        # Create more structured data for actual gestures
-                        dummy_sample = np.random.normal(0.5, 0.1, 63)
-                    
-                    dummy_data.append(dummy_sample)
-                    dummy_labels.append(i)
-            
-            X_train = np.array(dummy_data)
-            y_train = tf.keras.utils.to_categorical(dummy_labels, num_classes=len(self.gestures))
-            
-            # Quick training with dummy data
-            logger.info("Training model with dummy data...")
-            self.model.fit(X_train, y_train, epochs=10, verbose=0)
-            self.model.save(self.config.model_path)
-            logger.info("Model initialized with dummy data")
-        except Exception as e:
-            logger.error(f"Error creating dummy training data: {e}")
 
     @log_exceptions
     def _load_training_data(self) -> None:
@@ -539,7 +556,7 @@ class AccessibilityController:
 
     @log_exceptions
     def extract_keypoints(self, results: Any) -> Optional[np.ndarray]:
-        """Extract hand landmarks from MediaPipe results"""
+        """Extract and normalize hand landmarks from MediaPipe results"""
         if results and results.multi_hand_landmarks:
             try:
                 # Use the first hand detected
@@ -547,7 +564,12 @@ class AccessibilityController:
                 landmarks = []
                 for lm in hand_landmarks.landmark:
                     landmarks.extend([lm.x, lm.y, lm.z])
-                return np.array(landmarks)
+                
+                # Normalize the landmarks
+                landmarks_array = np.array(landmarks)
+                normalized_landmarks = self.normalize_landmarks(landmarks_array)
+                
+                return normalized_landmarks
             except Exception as e:
                 logger.error(f"Keypoint extraction error: {e}")
                 return np.zeros(21*3)
@@ -570,22 +592,22 @@ class AccessibilityController:
 
     @log_exceptions
     def recognize_gesture(self, landmarks: np.ndarray) -> Tuple[str, float]:
-        """Recognize gesture from landmarks with better validation"""
-        if (self.model is None or landmarks is None or 
+        """Improved gesture recognition with proper preprocessing"""
+        if (self.model is None or self.scaler is None or landmarks is None or 
             len(landmarks) != 63 or np.all(landmarks == 0)):
             return "none", 0.0
         
         try:
-            # Reshape for model prediction
-            landmarks = np.expand_dims(landmarks, axis=0)
+            # Reshape and scale the input
+            landmarks_scaled = self.scaler.transform(landmarks.reshape(1, -1))
             
             # Predict gesture
-            prediction = self.model.predict(landmarks, verbose=0)[0]
+            prediction = self.model.predict(landmarks_scaled, verbose=0)[0]
             predicted_class = np.argmax(prediction)
             confidence = prediction[predicted_class]
             
-            # Only return if confidence is above threshold
-            if confidence > self.config.gesture_confidence_threshold:
+            # Use a more reasonable confidence threshold
+            if confidence > 0.6:  # Adjusted threshold
                 return self.gestures[predicted_class], confidence
             else:
                 return "none", confidence
@@ -905,21 +927,20 @@ class AccessibilityController:
 
     @log_exceptions
     def validate_training_sample(self, keypoints: np.ndarray) -> bool:
-        """Validate a training sample meets requirements with comprehensive checks"""
+        """Improved validation for training samples"""
         if keypoints is None or not isinstance(keypoints, np.ndarray):
             return False
-        if keypoints.shape != (63,):  # 21 landmarks * 3 coordinates
-            return False
-        if np.all(keypoints == 0) or not np.any(keypoints):
+        if keypoints.shape != (63,):
             return False
         if np.any(np.isnan(keypoints)) or np.any(np.isinf(keypoints)):
             return False
         
-        # Relaxed validation: check if values are within reasonable range
-        if np.any(keypoints < -10.0) or np.any(keypoints > 10.0):
+        # More lenient validation - just check if hand is detected
+        # (normalized landmarks can have negative values, which is fine)
+        if np.all(keypoints == 0):
             return False
         
-        # Check for sufficient variation (not all points clustered together)
+        # Check for reasonable variation (hand should have some structure)
         if np.std(keypoints) < 0.001:
             return False
         
@@ -945,7 +966,7 @@ class AccessibilityController:
 
     @log_exceptions
     def capture_training_sample(self, gesture: str) -> int:
-        """Capture a training sample for the current gesture"""
+        """Improved training sample capture with better validation"""
         if not self.is_training or gesture != self.training_gesture:
             logger.warning("Not in training mode or gesture mismatch")
             return 0
@@ -957,13 +978,18 @@ class AccessibilityController:
                 
                 # Validate sample
                 if self.validate_training_sample(keypoints):
-                    # Add to training data with standardized format
+                    # Add to training data with improved format
                     sample = {
                         'keypoints': keypoints,
                         'timestamp': datetime.now().isoformat(),
                         'gesture': gesture,
-                        'version': '1.0'  # Standardized format version
+                        'version': '2.0',  # Updated format version
+                        'normalized': True  # Flag indicating data is normalized
                     }
+                    
+                    # Initialize if needed
+                    if gesture not in self.training_data:
+                        self.training_data[gesture] = []
                     
                     self.training_data[gesture].append(sample)
                     
@@ -976,14 +1002,14 @@ class AccessibilityController:
                     return sample_count
                 else:
                     logger.warning("Invalid sample (validation failed)")
-                    return 0
+                    return len(self.training_data.get(gesture, []))
                 
             except Exception as e:
                 logger.error(f"Error capturing training sample: {e}")
-                return 0
+                return len(self.training_data.get(gesture, []))
         else:
             logger.warning("No hand landmarks detected")
-            return 0
+            return len(self.training_data.get(gesture, []))
 
     @log_exceptions
     def save_training_data(self) -> bool:
@@ -1006,93 +1032,106 @@ class AccessibilityController:
             logger.error(f"Error saving training data: {e}")
             return False
         
-        
-    @log_exceptions
-    def restart_processing(self) -> bool:
-        """Restart the processing loop with fresh MediaPipe instance"""
-        self.stop_processing()
-        time.sleep(1.0)  # Give time for cleanup
-        
-        # Force reinitialization of MediaPipe
-        if hasattr(self, 'hands'):
-            try:
-                self.hands.close()
-            except:
-                pass
-            if hasattr(self, 'hands'):
-                del self.hands
-        
-        # Reinitialize MediaPipe
-        self._initialize_mediapipe()
-        
-        return self.start_processing()   
-
     @log_exceptions
     def train_model(self) -> Dict[str, Any]:
-        """Train the model with collected samples using standardized format with validation"""
+        """Improved model training with better data handling"""
         try:
-            # Comprehensive data validation
-            valid_samples = []
-            valid_labels = []
+            # Collect valid training samples
+            X_train = []
+            y_train = []
+            
+            # Count samples per gesture
+            gesture_counts = {}
             
             for i, gesture in enumerate(self.gestures):
                 if gesture in self.training_data and self.training_data[gesture]:
+                    valid_samples = []
                     for sample in self.training_data[gesture]:
-                        # Enhanced validation
-                        if (self.validate_training_sample(sample['keypoints']) and 
-                            sample.get('gesture') == gesture and
-                            'timestamp' in sample and
-                            sample.get('version') == '1.0'):
-                            
+                        if (isinstance(sample, dict) and 
+                            'keypoints' in sample and 
+                            self.validate_training_sample(sample['keypoints']) and
+                            sample.get('gesture') == gesture):
                             valid_samples.append(sample['keypoints'])
-                            valid_labels.append(i)
+                    
+                    gesture_counts[gesture] = len(valid_samples)
+                    
+                    # Add valid samples
+                    for keypoints in valid_samples:
+                        X_train.append(keypoints)
+                        y_train.append(i)
             
-            total_samples = len(valid_samples)
-            if total_samples < 10:  # Reduced from 20 to 10 for better usability
+            # Check if we have enough data
+            total_samples = len(X_train)
+            if total_samples < 15:  # Minimum samples needed
                 return {
                     "status": "error",
-                    "message": f"Not enough valid training data. Need at least 10 samples, have {total_samples}"
+                    "message": f"Not enough training data. Need at least 15 samples, have {total_samples}"
                 }
             
             # Check class distribution
-            unique_labels, counts = np.unique(valid_labels, return_counts=True)
-            min_samples = np.min(counts) if len(counts) > 0 else 0
+            unique_labels, counts = np.unique(y_train, return_counts=True)
+            min_samples_per_class = np.min(counts) if len(counts) > 0 else 0
             
-            if min_samples < 3:  # Reduced from 5 to 3 for better usability
+            if min_samples_per_class < 3:
                 return {
                     "status": "error",
-                    "message": f"Some gestures have too few samples. Minimum samples per gesture: 3"
+                    "message": f"Some gestures have too few samples. Need at least 3 samples per gesture. Current distribution: {dict(zip([self.gestures[i] for i in unique_labels], counts))}"
                 }
             
             # Convert to numpy arrays
-            X_train = np.array(valid_samples)
-            y_train = np.array(valid_labels)
+            X_train = np.array(X_train)
+            y_train = np.array(y_train)
+            
+            # Apply data scaling if we have a scaler
+            if self.scaler is None:
+                self.scaler = StandardScaler()
+            
+            # Fit and transform the data
+            X_train_scaled = self.scaler.fit_transform(X_train)
             
             # Convert labels to categorical
-            y_train = tf.keras.utils.to_categorical(y_train, num_classes=len(self.gestures))
+            num_classes = len(self.gestures)
+            y_train_categorical = tf.keras.utils.to_categorical(y_train, num_classes=num_classes)
             
-            # Split data (80% train, 20% validation)
-            split_idx = int(0.8 * len(X_train))
-            X_val, y_val = X_train[split_idx:], y_train[split_idx:]
-            X_train, y_train = X_train[:split_idx], y_train[:split_idx]
+            # Split data for validation
+            X_train_final, X_val, y_train_final, y_val = train_test_split(
+                X_train_scaled, y_train_categorical, 
+                test_size=0.2, 
+                random_state=42,
+                stratify=y_train
+            )
             
-            logger.info(f"Training on {len(X_train)} samples, validating on {len(X_val)} samples")
+            logger.info(f"Training on {len(X_train_final)} samples, validating on {len(X_val)} samples")
+            logger.info(f"Gesture distribution: {gesture_counts}")
             
-            # Create a new model if none exists
-            if self.model is None:
-                self.model = self._create_model()
+            # Create or reset model
+            self.model = self._create_improved_model()
             
-            # Train the model
+            # Define callbacks
+            callbacks = [
+                tf.keras.callbacks.EarlyStopping(
+                    monitor='val_categorical_accuracy',
+                    patience=10,
+                    restore_best_weights=True,
+                    verbose=1
+                ),
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor='val_categorical_accuracy',
+                    factor=0.5,
+                    patience=5,
+                    min_lr=1e-6,
+                    verbose=1
+                )
+            ]
+            
+            # Train the model with more epochs
             history = self.model.fit(
-                X_train, y_train,
+                X_train_final, y_train_final,
                 validation_data=(X_val, y_val),
-                epochs=50,
-                batch_size=32,
+                epochs=100,  # Increased epochs
+                batch_size=min(32, len(X_train_final) // 2),  # Adaptive batch size
                 verbose=1,
-                callbacks=[
-                    tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-                    tf.keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=3)
-                ]
+                callbacks=callbacks
             )
             
             # Get training results
@@ -1102,11 +1141,16 @@ class AccessibilityController:
             
             logger.info(f"Training completed. Accuracy: {final_accuracy:.2%}, Validation Accuracy: {final_val_accuracy:.2%}")
             
+            # Save model and scaler
+            self.save_model()
+            
             return {
                 "status": "success",
                 "accuracy": float(final_accuracy),
                 "val_accuracy": float(final_val_accuracy),
-                "loss": float(final_loss)
+                "loss": float(final_loss),
+                "total_samples": total_samples,
+                "gesture_counts": gesture_counts
             }
             
         except Exception as e:
@@ -1118,13 +1162,23 @@ class AccessibilityController:
 
     @log_exceptions
     def save_model(self) -> bool:
-        """Save the trained model to file"""
+        """Save model and scaler"""
         try:
             if self.model is not None:
                 model_dir = os.path.dirname(self.config.model_path)
                 os.makedirs(model_dir, exist_ok=True)
+                
+                # Save model
                 self.model.save(self.config.model_path)
                 logger.info("Model saved successfully")
+                
+                # Save scaler
+                if self.scaler is not None:
+                    scaler_path = self.config.model_path.replace('.h5', '_scaler.pkl')
+                    with open(scaler_path, 'wb') as f:
+                        pickle.dump(self.scaler, f)
+                    logger.info("Scaler saved successfully")
+                
                 return True
             return False
         except Exception as e:
@@ -1133,9 +1187,17 @@ class AccessibilityController:
 
     @log_exceptions
     def get_training_status(self) -> Dict[str, Any]:
-        """Get training status and statistics with standardized format"""
+        """Get training status with improved information"""
         total_samples = sum(len(samples) for samples in self.training_data.values())
         current_samples = len(self.training_data[self.training_gesture]) if self.training_gesture in self.training_data else 0
+        
+        # Calculate per-gesture statistics
+        gesture_stats = {}
+        for gesture in self.gestures:
+            if gesture in self.training_data:
+                gesture_stats[gesture] = len(self.training_data[gesture])
+            else:
+                gesture_stats[gesture] = 0
         
         return {
             "current_gesture": self.training_gesture,
@@ -1143,7 +1205,10 @@ class AccessibilityController:
             "total_samples": total_samples,
             "is_training": self.is_training,
             "gestures_trained": [g for g in self.gestures if g in self.training_data and self.training_data[g]],
-            "format_version": "1.0"
+            "format_version": "2.0",
+            "gesture_stats": gesture_stats,
+            "min_samples_per_gesture": 5,  # Recommended minimum
+            "ready_for_training": total_samples >= 15 and len([g for g in gesture_stats.values() if g >= 3]) >= 2
         }
 
     @log_exceptions
@@ -1175,7 +1240,7 @@ class AccessibilityController:
                 'metadata': {
                     'export_date': datetime.now().isoformat(),
                     'total_samples': sum(len(samples) for samples in self.training_data.values()),
-                    'format_version': '1.0',
+                    'format_version': '2.0',
                     'gestures': list(self.training_data.keys())
                 },
                 'samples': self.training_data
@@ -1205,6 +1270,26 @@ class AccessibilityController:
         except Exception as e:
             logger.error(f"Error exporting training data: {e}")
             return None
+
+    @log_exceptions
+    def restart_processing(self) -> bool:
+        """Restart the processing loop with fresh MediaPipe instance"""
+        self.stop_processing()
+        time.sleep(1.0)  # Give time for cleanup
+        
+        # Force reinitialization of MediaPipe
+        if hasattr(self, 'hands'):
+            try:
+                self.hands.close()
+            except:
+                pass
+            if hasattr(self, 'hands'):
+                del self.hands
+        
+        # Reinitialize MediaPipe
+        self._initialize_mediapipe()
+        
+        return self.start_processing()   
 
     @log_exceptions
     def run(self) -> None:
