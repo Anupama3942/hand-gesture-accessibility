@@ -54,7 +54,10 @@ def check_dependencies():
     try:
         import flask
         import mediapipe
-        import tensorflow
+        try:
+            import tensorflow
+        except ImportError:
+            logger.warning("TensorFlow not available - gesture recognition will be disabled")
         import cv2
         import pyautogui
         import pynput

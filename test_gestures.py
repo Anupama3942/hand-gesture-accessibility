@@ -120,6 +120,7 @@ def test_model_performance():
         if i % 4 == 0:
             # "none" gesture - more random
             keypoints = np.random.normal(0.5, 0.3, 63)
+            y_test.append(0)  # Add label for "none" gesture
         else:
             # Actual gesture - more structured
             gesture_idx = (i % (len(controller.gestures) - 1)) + 1  # Skip "none"

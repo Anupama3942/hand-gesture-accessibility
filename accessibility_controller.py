@@ -2,26 +2,52 @@
 import cv2
 import numpy as np
 import mediapipe as mp
-import tensorflow as tf
-import pyautogui
-import pyttsx3
+from logging_config import logger, log_exceptions
+try:
+    import tensorflow as tf
+except ImportError:
+    tf = None
+    logger.warning("TensorFlow not available. Gesture recognition will be disabled.")
+
+try:
+    import pyautogui
+    # Fail-safe mode
+    pyautogui.FAILSAFE = True
+except ImportError:
+    pyautogui = None
+    logger.warning("PyAutoGUI not available. Mouse control will be disabled.")
+
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+    logger.warning("pyttsx3 not available. Voice feedback will be disabled.")
+
 import time
 import threading
 from typing import Optional, Dict, Any, List, Tuple, Union
-from pynput import keyboard, mouse
-from pynput.keyboard import Controller as KeyController, Key
-from pynput.mouse import Controller as MouseController, Button
 import os
 import json
 import platform
 from datetime import datetime
 import pickle
 import gc
+
+try:
+    from pynput.keyboard import Controller as KeyController, Key
+    from pynput.mouse import Controller as MouseController, Button
+except ImportError:
+    KeyController = None
+    MouseController = None
+    Key = None
+    Button = None
+    logger.warning("pynput not available. Advanced input control will be disabled.")
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
-from logging_config import logger, log_exceptions
+
 from config import config_manager, SystemConfig
+from accessibility_utils import PerformanceMonitor
 
 class AccessibilityController:
     def __init__(self):
@@ -31,8 +57,11 @@ class AccessibilityController:
         self._initialize_mediapipe()
         
         # Screen dimensions
-        self.screen_width, self.screen_height = pyautogui.size()
-        
+        if pyautogui:
+            self.screen_width, self.screen_height = pyautogui.size()
+        else:
+            self.screen_width, self.screen_height = 1920, 1080
+            
         # Gesture recognition model
         self.gestures = np.array([
             'none', 'cursor_mode', 'click', 'right_click', 'double_click', 'drag',
@@ -43,7 +72,7 @@ class AccessibilityController:
             'switch_app', 'desktop', 'task_view', 'help'
         ])
         
-        self.model: Optional[tf.keras.Model] = None
+        self.model: Optional[Any] = None  # Allow Any if tf is None
         self.scaler: Optional[StandardScaler] = None
         self._initialize_model()
         
@@ -61,8 +90,8 @@ class AccessibilityController:
         self.shutdown_event = threading.Event()
         
         # Mouse control
-        self.mouse_controller = MouseController()
-        self.key_controller = KeyController()
+        self.mouse_controller = MouseController() if MouseController else None
+        self.key_controller = KeyController() if KeyController else None
         self.cursor_mode = False
         self.dragging = False
         
@@ -79,6 +108,7 @@ class AccessibilityController:
         self._load_training_data()
         
         # Performance monitoring
+        self.performance_monitor = PerformanceMonitor()
         self.performance_stats = {
             'fps': 0,
             'last_update': time.time(),
@@ -128,6 +158,12 @@ class AccessibilityController:
     @log_exceptions
     def _initialize_model(self) -> None:
         """Load or create the gesture recognition model"""
+        if tf is None:
+            logger.warning("TensorFlow not available, skipping model initialization")
+            self.model = None
+            self.scaler = None
+            return
+
         try:
             model_dir = os.path.dirname(self.config.model_path)
             os.makedirs(model_dir, exist_ok=True)
@@ -158,8 +194,11 @@ class AccessibilityController:
             self.scaler = None
 
     @log_exceptions
-    def _create_improved_model(self) -> tf.keras.Model:
+    def _create_improved_model(self) -> Optional[Any]:
         """Create an improved model for gesture recognition"""
+        if tf is None:
+            return None
+
         try:
             # Improved model architecture with regularization
             model = tf.keras.Sequential([
@@ -221,6 +260,11 @@ class AccessibilityController:
     @log_exceptions
     def _initialize_voice(self) -> None:
         """Initialize voice feedback system"""
+        if pyttsx3 is None:
+            self.voice_engine = None
+            self.voice_enabled = False
+            return
+
         try:
             self.voice_engine = pyttsx3.init()
             self.voice_engine.setProperty('rate', 150)
@@ -230,6 +274,7 @@ class AccessibilityController:
         except Exception as e:
             logger.warning(f"Voice engine initialization failed: {e}")
             self.voice_engine = None
+            self.voice_enabled = False
             self.voice_enabled = False
 
     @log_exceptions
@@ -423,17 +468,29 @@ class AccessibilityController:
 
     @log_exceptions
     def _update_performance_stats(self, frame_count: int, frame_times: List[float]) -> None:
-        """Update performance statistics"""
+        """Update performance statistics using monitor"""
         try:
             if frame_times:
-                avg_fps = frame_count / (time.time() - self.performance_stats['last_update'])
+                current_time = time.time()
+                elapsed = current_time - self.performance_stats['last_update']
+                if elapsed > 0:
+                    fps = frame_count / elapsed
+                    self.performance_monitor.update_fps(fps)
+                
                 avg_frame_time = np.mean(frame_times) * 1000  # ms
+                self.performance_monitor.update_latency(avg_frame_time)
+                
+                # Get aggregated stats
+                monitor_stats = self.performance_monitor.get_stats()
                 
                 self.performance_stats.update({
-                    'fps': avg_fps,
+                    'fps': monitor_stats.get('fps', 0),
+                    'latency_ms': monitor_stats.get('latency_ms', 0),
+                    'fps_min': monitor_stats.get('fps_min', 0),
+                    'fps_max': monitor_stats.get('fps_max', 0),
                     'frame_count': frame_count,
                     'avg_frame_time': avg_frame_time,
-                    'last_update': time.time(),
+                    'last_update': current_time,
                     'memory_usage': self._get_memory_usage()
                 })
         except Exception as e:
@@ -459,7 +516,7 @@ class AccessibilityController:
             gc.collect()
             
             # Clear TensorFlow session if it exists
-            if hasattr(tf, 'keras'):
+            if tf is not None and hasattr(tf, 'keras'):
                 tf.keras.backend.clear_session()
                 
         except Exception as e:
@@ -526,7 +583,7 @@ class AccessibilityController:
                     logger.debug(f"MediaPipe cleanup warning: {e}")
             
             # Clear TensorFlow session
-            if hasattr(tf, 'keras'):
+            if tf is not None and hasattr(tf, 'keras'):
                 tf.keras.backend.clear_session()
             
             # Clear frame variables but keep other state
@@ -619,7 +676,7 @@ class AccessibilityController:
     @log_exceptions
     def control_cursor(self, hand_landmarks: Any) -> None:
         """Control mouse cursor with hand position"""
-        if not self.cursor_mode or hand_landmarks is None:
+        if not self.cursor_mode or hand_landmarks is None or self.mouse_controller is None:
             return
         
         try:
@@ -729,6 +786,8 @@ class AccessibilityController:
     def execute_browser_command(self, command: str) -> None:
         """Execute browser-specific commands with fallbacks"""
         try:
+            if self.key_controller is None:
+                return
             # Try browser-specific keys first
             browser_keys = {
                 'back': ('browser_back', 'chrome_back'),
@@ -767,7 +826,7 @@ class AccessibilityController:
     @log_exceptions
     def handle_drag(self, hand_landmarks: Any) -> None:
         """Handle drag gesture"""
-        if not self.cursor_mode or not hand_landmarks:
+        if not self.cursor_mode or not hand_landmarks or self.mouse_controller is None:
             return
             
         try:
@@ -785,6 +844,8 @@ class AccessibilityController:
     def execute_key_combo(self, modifier: Any, key: Any) -> None:
         """Execute keyboard combinations safely"""
         try:
+            if self.key_controller is None:
+                return
             if modifier:
                 with self.key_controller.pressed(modifier):
                     if isinstance(key, str):
@@ -882,7 +943,11 @@ class AccessibilityController:
                 "current_gesture": self.current_gesture,
                 "hand_detected": hand_detected,
                 "hand_count": hand_count,
-                "performance": self.performance_stats
+                "performance": self.performance_stats,
+                "history": {
+                    "fps": self.performance_monitor.fps_history[-50:],  # Last 50 points
+                    "latency": self.performance_monitor.latency_history[-50:]
+                }
             }
             
             # Sanitize data for JSON serialization
@@ -1035,6 +1100,12 @@ class AccessibilityController:
     @log_exceptions
     def train_model(self) -> Dict[str, Any]:
         """Improved model training with better data handling"""
+        if tf is None:
+            return {
+                "status": "error",
+                "message": "TensorFlow is not available. Cannot train model."
+            }
+
         try:
             # Collect valid training samples
             X_train = []

@@ -127,7 +127,7 @@ class PerformanceMonitor:
         
         return {
             "fps": sum(self.fps_history) / len(self.fps_history),
-            "latency_ms": sum(self.latency_history) / len(self.lativity_history) if self.latency_history else 0,
+            "latency_ms": sum(self.latency_history) / len(self.latency_history) if self.latency_history else 0,
             "fps_min": min(self.fps_history),
             "fps_max": max(self.fps_history)
         }
