@@ -1,10 +1,35 @@
-# accessibility_controller.py - Combined improved version
+import os
+import json
+import platform
 import cv2
 import numpy as np
-import mediapipe as mp
+from typing import TYPE_CHECKING, Any
 from logging_config import logger, log_exceptions
+
+try:
+    import mediapipe as mp
+    if not hasattr(mp, "solutions"):
+        raise ImportError("mediapipe.solutions is unavailable")
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    mp = None
+    MEDIAPIPE_AVAILABLE = False
+    logger.warning("MediaPipe not available. Hand tracking features will be disabled.")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+
 try:
     import tensorflow as tf
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+    except Exception:
+        pass
+    try:
+        tf.config.set_visible_devices([], 'GPU')
+    except Exception:
+        pass
 except ImportError:
     tf = None
     logger.warning("TensorFlow not available. Gesture recognition will be disabled.")
@@ -23,12 +48,15 @@ except ImportError:
     pyttsx3 = None
     logger.warning("pyttsx3 not available. Voice feedback will be disabled.")
 
+if TYPE_CHECKING:
+    import pyttsx3 as _pyttsx3
+    Pyttsx3Engine = _pyttsx3.Engine
+else:
+    Pyttsx3Engine = Any
+
 import time
 import threading
 from typing import Optional, Dict, Any, List, Tuple, Union
-import os
-import json
-import platform
 from datetime import datetime
 import pickle
 import gc
@@ -42,8 +70,141 @@ except ImportError:
     Key = None
     Button = None
     logger.warning("pynput not available. Advanced input control will be disabled.")
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split
+    from sklearn.utils.validation import check_is_fitted
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    logger.warning("scikit-learn not available. Falling back to numpy implementations.")
+
+    class _NumpyStandardScaler:
+        """Minimal StandardScaler replacement to avoid hard dependency on sklearn."""
+
+        def __init__(self):
+            self.mean_ = None
+            self.scale_ = None
+            self.var_ = None
+            self.n_features_in_ = None
+            self._is_fitted = False
+
+        def fit(self, X):
+            data = self._validate_array(X)
+            self.mean_ = np.mean(data, axis=0)
+            self.var_ = np.var(data, axis=0)
+            self.scale_ = np.sqrt(self.var_)
+            # Avoid divide-by-zero for constant features
+            self.scale_[self.scale_ == 0] = 1.0
+            self.n_features_in_ = data.shape[1]
+            self._is_fitted = True
+            return self
+
+        def transform(self, X):
+            self._ensure_fitted()
+            data = self._validate_array(X, check_n_features=True)
+            return (data - self.mean_) / self.scale_
+
+        def fit_transform(self, X):
+            return self.fit(X).transform(X)
+
+        def _validate_array(self, X, check_n_features: bool = False) -> np.ndarray:
+            data = np.asarray(X, dtype=np.float64)
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            if data.ndim != 2:
+                raise ValueError("Expected 2D array for scaler operations")
+            if check_n_features and data.shape[1] != self.n_features_in_:
+                raise ValueError("Feature count mismatch for scaler transform")
+            return data
+
+        def _ensure_fitted(self) -> None:
+            if not self._is_fitted:
+                raise RuntimeError("Scaler instance is not fitted yet")
+
+    def _numpy_check_is_fitted(estimator) -> None:
+        if not getattr(estimator, "_is_fitted", False):
+            raise RuntimeError("Estimator is not fitted")
+
+    def _numpy_train_test_split(*arrays,
+                                test_size: Union[float, int] = 0.25,
+                                random_state: Optional[int] = None,
+                                stratify: Optional[np.ndarray] = None):
+        if not arrays:
+            raise ValueError("At least one array is required for train_test_split")
+
+        n_samples = len(arrays[0])
+        for arr in arrays:
+            if len(arr) != n_samples:
+                raise ValueError("All arrays must contain the same number of samples")
+
+        if isinstance(test_size, float):
+            if not 0 < test_size < 1:
+                raise ValueError("test_size float must be between 0 and 1")
+            desired_test = max(1, int(round(n_samples * test_size)))
+        elif isinstance(test_size, int):
+            if not 0 < test_size < n_samples:
+                raise ValueError("test_size int must be between 1 and n_samples - 1")
+            desired_test = test_size
+        else:
+            raise TypeError("test_size must be float or int")
+
+        rng = np.random.default_rng(random_state)
+        all_indices = np.arange(n_samples)
+        indices = all_indices.copy()
+
+        if stratify is not None:
+            stratify = np.asarray(stratify)
+            if len(stratify) != n_samples:
+                raise ValueError("Stratify array must be same length as inputs")
+
+            test_indices = []
+            test_fraction = desired_test / n_samples
+            for label in np.unique(stratify):
+                label_idx = np.where(stratify == label)[0]
+                rng.shuffle(label_idx)
+                label_test = max(1, int(round(len(label_idx) * test_fraction)))
+                if label_test >= len(label_idx):
+                    label_test = max(1, len(label_idx) - 1)
+                test_indices.extend(label_idx[:label_test])
+
+            test_indices = np.array(sorted(set(test_indices)), dtype=int)
+            if test_indices.size > desired_test:
+                test_indices = test_indices[:desired_test]
+            elif test_indices.size < desired_test:
+                remaining = np.setdiff1d(all_indices, test_indices, assume_unique=False)
+                rng.shuffle(remaining)
+                needed = desired_test - test_indices.size
+                test_indices = np.concatenate([test_indices, remaining[:needed]])
+        else:
+            rng.shuffle(indices)
+            test_indices = indices[:desired_test]
+
+        mask = np.ones(n_samples, dtype=bool)
+        mask[test_indices] = False
+        train_indices = all_indices[mask]
+
+        if train_indices.size == 0:
+            train_indices = test_indices[:1]
+            test_indices = test_indices[1:]
+
+        split = []
+        for arr in arrays:
+            data = np.asarray(arr)
+            split.append(data[train_indices])
+            split.append(data[test_indices])
+        return tuple(split)
+
+        StandardScaler = _NumpyStandardScaler
+        train_test_split = _numpy_train_test_split
+        check_is_fitted = _numpy_check_is_fitted
+    
+    # Type alias for scaler to satisfy type checkers even if sklearn is unavailable
+    if TYPE_CHECKING:
+        from sklearn.preprocessing import StandardScaler as SklearnStandardScaler
+        ScalerType = SklearnStandardScaler
+    else:
+        ScalerType = Any
 
 
 from config import config_manager, SystemConfig
@@ -73,7 +234,7 @@ class AccessibilityController:
         ])
         
         self.model: Optional[Any] = None  # Allow Any if tf is None
-        self.scaler: Optional[StandardScaler] = None
+        self.scaler: Optional[ScalerType] = None
         self._initialize_model()
         
         # Control state
@@ -96,7 +257,7 @@ class AccessibilityController:
         self.dragging = False
         
         # Voice feedback
-        self.voice_engine: Optional[pyttsx3.Engine] = None
+        self.voice_engine: Optional[Pyttsx3Engine] = None
         self.voice_enabled = False
         self._initialize_voice()
         self._speech_lock = threading.Lock()
@@ -120,6 +281,13 @@ class AccessibilityController:
     @log_exceptions
     def _initialize_mediapipe(self) -> None:
         """Initialize MediaPipe with proper cleanup and error handling"""
+        if not MEDIAPIPE_AVAILABLE:
+            logger.warning("MediaPipe unavailable. Controller will run without hand tracking.")
+            self.hands = None
+            self.mp_hands = None
+            self.mp_draw = None
+            return
+
         try:
             # Clean up existing instance completely
             if hasattr(self, 'hands'):
@@ -274,7 +442,6 @@ class AccessibilityController:
         except Exception as e:
             logger.warning(f"Voice engine initialization failed: {e}")
             self.voice_engine = None
-            self.voice_enabled = False
             self.voice_enabled = False
 
     @log_exceptions
@@ -600,6 +767,9 @@ class AccessibilityController:
     @log_exceptions
     def mediapipe_detection(self, image: np.ndarray) -> Tuple[np.ndarray, Any]:
         """Process image with MediaPipe Hands"""
+        if self.hands is None:
+            return image, None
+
         try:
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image_rgb.flags.writeable = False
@@ -635,6 +805,9 @@ class AccessibilityController:
     @log_exceptions
     def draw_landmarks(self, image: np.ndarray, results: Any) -> np.ndarray:
         """Draw hand landmarks on the image"""
+        if not self.mp_draw:
+            return image
+
         if results and results.multi_hand_landmarks:
             try:
                 for hand_landmarks in results.multi_hand_landmarks:
@@ -655,8 +828,13 @@ class AccessibilityController:
             return "none", 0.0
         
         try:
-            # Reshape and scale the input
-            landmarks_scaled = self.scaler.transform(landmarks.reshape(1, -1))
+            # Check if scaler is fitted before transform
+            try:
+                check_is_fitted(self.scaler)
+                landmarks_scaled = self.scaler.transform(landmarks.reshape(1, -1))
+            except Exception:
+                logger.debug("Scaler not fitted yet. Returning none.")
+                return "none", 0.0
             
             # Predict gesture
             prediction = self.model.predict(landmarks_scaled, verbose=0)[0]

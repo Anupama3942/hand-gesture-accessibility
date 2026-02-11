@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import cv2
 import numpy as np
-import mediapipe as mp
 from accessibility_controller import AccessibilityController
 import time
 import logging

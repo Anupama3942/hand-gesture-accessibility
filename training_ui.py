@@ -2,7 +2,10 @@ import cv2
 import numpy as np
 import json
 import os
-import tensorflow as tf
+try:
+    import tensorflow as tf
+except ImportError:
+    tf = None
 from accessibility_controller import AccessibilityController
 import logging
 
@@ -217,6 +220,9 @@ class TrainingUI:
         y_train = np.array(y_train)
         
         # Convert labels to categorical
+        if tf is None:
+            print("TensorFlow not available. Cannot train model.")
+            return
         y_train = tf.keras.utils.to_categorical(y_train, num_classes=len(self.gestures))
         
         # Split data (80% train, 20% validation)
@@ -228,7 +234,7 @@ class TrainingUI:
         
         # Create a new model if none exists
         if self.controller.model is None:
-            self.controller.model = self.controller.create_model()
+            self.controller.model = self.controller._create_improved_model()
         
         # Train the model
         self.controller.model.fit(

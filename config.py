@@ -92,7 +92,9 @@ class ConfigManager:
     def save_config(self) -> bool:
         """Save configuration to file"""
         try:
-            os.makedirs(os.path.dirname(self.config.settings_path), exist_ok=True)
+            settings_dir = os.path.dirname(self.config.settings_path)
+            if settings_dir:
+                os.makedirs(settings_dir, exist_ok=True)
             with open(self.config.settings_path, 'w') as f:
                 json.dump(self.config.to_dict(), f, indent=2)
             logger.info("Configuration saved successfully")
