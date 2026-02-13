@@ -941,23 +941,23 @@
         captureInterval = setInterval(async () => {
           if (!isTraining) {
             clearInterval(captureInterval);
+            captureInterval = null;
             return;
           }
 
           try {
-            const response = await fetch("/capture_sample", {
+            const data = await apiCall("/capture_sample", {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
               body: JSON.stringify({ gesture: currentGesture }),
             });
 
-            if (!response.ok) {
-              throw new Error("Failed to capture sample");
+            if (!data.captured) {
+              const feedbackElement = document.getElementById("training-status");
+              feedbackElement.textContent =
+                data.message || "No valid hand landmarks detected";
+              feedbackElement.className = "training-status status-waiting";
+              return;
             }
-
-            const data = await response.json();
 
             // Update UI with sample count
             document.getElementById("samples-collected").textContent =
@@ -1258,6 +1258,17 @@
 
             isTraining = data.is_training;
 
+            // Ensure capture loop is active if backend is training
+            if (isTraining && currentGesture && !captureInterval) {
+              startCapturingSamples();
+            }
+
+            // Ensure capture loop is stopped if backend is not training
+            if (!isTraining && captureInterval) {
+              clearInterval(captureInterval);
+              captureInterval = null;
+            }
+
             updateProgress();
 
             // Update button states
@@ -1265,7 +1276,7 @@
               !currentGesture || isTraining;
             document.getElementById("stop-training-btn").disabled = !isTraining;
             document.getElementById("train-model-btn").disabled =
-              totalSamples < 10;
+              !data.ready_for_training;
 
             // Update training status text
             if (isTraining) {

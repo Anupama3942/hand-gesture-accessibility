@@ -102,7 +102,21 @@ def main():
             return 1
         
         # Now import and run your app
-        from accessibility_web import app, controller
+        import accessibility_web as web
+        app = web.app
+        controller = web.controller
+
+        # Auto-start controller so camera feed is active when UI opens
+        try:
+            if not web.is_running:
+                logger.info("Starting controller for camera feed...")
+                web.is_running = controller.restart_processing()
+                if web.is_running:
+                    logger.info("Controller started successfully")
+                else:
+                    logger.warning("Controller could not start. Camera feed may be unavailable.")
+        except Exception as e:
+            logger.warning(f"Controller auto-start failed: {e}")
         
         logger.info("Starting Accessibility Control System...")
         logger.info("Server will be available at http://localhost:5000")
@@ -121,7 +135,8 @@ def main():
             port=5000, 
             debug=False, 
             threaded=True,
-            use_reloader=False
+            use_reloader=False,
+            load_dotenv=False
         )
         
         return 0

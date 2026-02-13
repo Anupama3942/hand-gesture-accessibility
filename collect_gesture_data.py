@@ -44,14 +44,9 @@ def collect_gesture_data():
         samples_to_collect = int(input("How many samples to collect? "))
         
         # Enable training mode for the selected gesture
-        if hasattr(controller, 'enable_training_mode'):
-            controller.enable_training_mode(selected_gesture)
-        elif hasattr(controller, 'start_training_session'):
-            controller.start_training_session(selected_gesture)
-        else:
-            # Fallback: set training gesture directly if available
-            controller.current_training_gesture = selected_gesture
-            controller.is_training_mode = True
+        if not controller.start_training(selected_gesture):
+            print(f"Failed to start training for {selected_gesture}")
+            return
         
         print(f"\nCollecting {samples_to_collect} samples for {selected_gesture}")
         print("Press 'c' to capture sample, 'q' to quit")
@@ -69,6 +64,16 @@ def collect_gesture_data():
             frame = cv2.flip(frame, 1)
             image, results = controller.mediapipe_detection(frame)
             image = controller.draw_landmarks(image, results)
+
+            # Keep controller state aligned with current detection frame
+            controller.current_results = results
+            keypoints = controller.extract_keypoints(results)
+            if keypoints is not None and controller.validate_training_sample(keypoints):
+                controller.latest_keypoints = keypoints.copy()
+                controller.latest_keypoints_timestamp = time.time()
+                controller.latest_hand_detected = True
+            else:
+                controller.latest_hand_detected = False
             
             # Display instructions
             cv2.putText(image, f"Gesture: {selected_gesture}", (10, 30), 
@@ -94,12 +99,8 @@ def collect_gesture_data():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('c'):
                 # Ensure training mode is enabled
-                if not hasattr(controller, 'is_training_mode') or not controller.is_training_mode:
-                    if hasattr(controller, 'enable_training_mode'):
-                        controller.enable_training_mode(selected_gesture)
-                    else:
-                        controller.current_training_gesture = selected_gesture
-                        controller.is_training_mode = True
+                if not controller.is_training or controller.training_gesture != selected_gesture:
+                    controller.start_training(selected_gesture)
                 
                 # Capture sample using controller's standardized method
                 sample_count = controller.capture_training_sample(selected_gesture)
@@ -139,13 +140,11 @@ def collect_gesture_data():
                     print(f"Training failed: {result['message']}")
         
         # Disable training mode
-        if hasattr(controller, 'disable_training_mode'):
-            controller.disable_training_mode()
-        elif hasattr(controller, 'end_training_session'):
-            controller.end_training_session()
-        else:
-            controller.is_training_mode = False
+        controller.is_training = False
+        controller.training_gesture = None
     
+    except KeyboardInterrupt:
+        print("\nCollection interrupted by user.")
     except ValueError:
         print("Please enter a valid number")
     except Exception as e:
@@ -153,6 +152,10 @@ def collect_gesture_data():
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        try:
+            controller.cleanup_resources()
+        except Exception:
+            pass
 
 def batch_collect_gestures():
     """Collect data for multiple gestures in batch mode"""
@@ -173,13 +176,9 @@ def batch_collect_gestures():
         print("")
         
         # Enable training mode for the current gesture
-        if hasattr(controller, 'enable_training_mode'):
-            controller.enable_training_mode(gesture)
-        elif hasattr(controller, 'start_training_session'):
-            controller.start_training_session(gesture)
-        else:
-            controller.current_training_gesture = gesture
-            controller.is_training_mode = True
+        if not controller.start_training(gesture):
+            print(f"Failed to start training for {gesture}. Skipping.")
+            continue
         
         samples_collected = 0
         
@@ -189,58 +188,70 @@ def batch_collect_gestures():
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
         while samples_collected < samples_per_gesture:
-            ret, frame = cap.read()
-            if not ret:
-                continue
+            try:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
             
-            frame = cv2.flip(frame, 1)
-            image, results = controller.mediapipe_detection(frame)
-            image = controller.draw_landmarks(image, results)
+                frame = cv2.flip(frame, 1)
+                image, results = controller.mediapipe_detection(frame)
+                image = controller.draw_landmarks(image, results)
+
+                # Keep controller state aligned with current detection frame
+                controller.current_results = results
+                keypoints = controller.extract_keypoints(results)
+                if keypoints is not None and controller.validate_training_sample(keypoints):
+                    controller.latest_keypoints = keypoints.copy()
+                    controller.latest_keypoints_timestamp = time.time()
+                    controller.latest_hand_detected = True
+                else:
+                    controller.latest_hand_detected = False
             
-            # Display instructions
-            cv2.putText(image, f"Gesture: {gesture}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(image, f"Samples: {samples_collected}/{samples_per_gesture}", (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(image, "Press 'c' to capture, 'n' for next, 'q' to quit", (10, 90), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # Display instructions
+                cv2.putText(image, f"Gesture: {gesture}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(image, f"Samples: {samples_collected}/{samples_per_gesture}", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(image, "Press 'c' to capture, 'n' for next, 'q' to quit", (10, 90), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            cv2.imshow('Batch Collection', image)
+                cv2.imshow('Batch Collection', image)
             
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('c'):
-                # Ensure training mode is enabled
-                if not hasattr(controller, 'is_training_mode') or not controller.is_training_mode:
-                    if hasattr(controller, 'enable_training_mode'):
-                        controller.enable_training_mode(gesture)
-                    else:
-                        controller.current_training_gesture = gesture
-                        controller.is_training_mode = True
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('c'):
+                    # Ensure training mode is enabled
+                    if not controller.is_training or controller.training_gesture != gesture:
+                        controller.start_training(gesture)
                 
-                sample_count = controller.capture_training_sample(gesture)
-                if sample_count > 0:
-                    samples_collected = sample_count
-                    print(f"Captured sample {samples_collected}/{samples_per_gesture}")
+                    sample_count = controller.capture_training_sample(gesture)
+                    if sample_count > 0:
+                        samples_collected = sample_count
+                        print(f"Captured sample {samples_collected}/{samples_per_gesture}")
             
-            elif key == ord('n'):
-                print(f"Moving to next gesture. Collected {samples_collected} samples for {gesture}")
+                elif key == ord('n'):
+                    print(f"Moving to next gesture. Collected {samples_collected} samples for {gesture}")
+                    break
+            
+                elif key == ord('q'):
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    controller.is_training = False
+                    controller.training_gesture = None
+                    try:
+                        controller.cleanup_resources()
+                    except Exception:
+                        pass
+                    return
+            except KeyboardInterrupt:
+                print("\nBatch collection interrupted by user.")
                 break
-            
-            elif key == ord('q'):
-                cap.release()
-                cv2.destroyAllWindows()
-                return
         
         cap.release()
         cv2.destroyAllWindows()
         
         # Disable training mode after each gesture
-        if hasattr(controller, 'disable_training_mode'):
-            controller.disable_training_mode()
-        elif hasattr(controller, 'end_training_session'):
-            controller.end_training_session()
-        else:
-            controller.is_training_mode = False
+        controller.is_training = False
+        controller.training_gesture = None
     
     # Save all data and train model
     controller.save_training_data()
@@ -253,6 +264,10 @@ def batch_collect_gestures():
             print("Model saved successfully!")
     else:
         print(f"Training failed: {result['message']}")
+    try:
+        controller.cleanup_resources()
+    except Exception:
+        pass
 
 def check_controller_methods(controller):
     """Helper function to check available methods in the controller"""
@@ -262,9 +277,9 @@ def check_controller_methods(controller):
         print(f"  - {method}")
     
     print("\nChecking for training-related attributes:")
-    training_attrs = ['enable_training_mode', 'disable_training_mode', 
-                     'start_training_session', 'end_training_session',
-                     'is_training_mode', 'current_training_gesture']
+    training_attrs = ['start_training', 'capture_training_sample',
+                     'is_training', 'training_gesture',
+                     'latest_keypoints', 'latest_hand_detected']
     
     for attr in training_attrs:
         if hasattr(controller, attr):

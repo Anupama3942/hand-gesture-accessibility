@@ -235,6 +235,8 @@ def logout():
 def video_feed():
     """Video streaming route"""
     def generate():
+        last_frame_id = -1
+        cached_payload = None
         while True:
             try:
                 frame = controller.get_current_frame()
@@ -253,25 +255,40 @@ def video_feed():
                 # Add current gesture
                 gesture_text = f"Gesture: {controller.current_gesture}"
                 cv2.putText(frame, gesture_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+                # Tiny debug label for recognition source
+                source_text = f"Source: {getattr(controller, 'last_recognition_source', 'none')}"
+                cv2.putText(frame, source_text, (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
                 
                 # Add hand detection status
                 if controller.current_results and hasattr(controller.current_results, 'multi_hand_landmarks') and controller.current_results.multi_hand_landmarks:
                     hands_text = f"Hands: {len(controller.current_results.multi_hand_landmarks)}"
-                    cv2.putText(frame, hands_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(frame, hands_text, (10, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                ret, jpeg = cv2.imencode('.jpg', frame)
-                if not ret:
+                frame_id = getattr(controller, 'current_frame_id', 0)
+                if frame is not None and frame_id != last_frame_id:
+                    jpeg_quality = max(40, min(90, int(getattr(controller.config, 'stream_jpeg_quality', 65))))
+                    ret, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+                    if not ret:
+                        time.sleep(0.005)
+                        continue
+                    frame_bytes = jpeg.tobytes()
+                    cached_payload = (b'--frame\r\n'
+                                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n\r\n')
+                    last_frame_id = frame_id
+
+                if cached_payload is not None:
+                    yield cached_payload
+                else:
+                    time.sleep(0.005)
                     continue
-                    
-                frame_bytes = jpeg.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n\r\n')
                        
             except Exception as e:
                 logger.error(f"Video feed error: {e}")
                 time.sleep(0.1)
             
-            time.sleep(0.033)  # ~30 FPS
+            target_fps = max(15, int(getattr(controller.config, 'target_fps', 24)))
+            time.sleep(1.0 / target_fps)
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
@@ -301,6 +318,9 @@ def handle_settings():
             
             # Update configuration
             if config_manager.update_config(new_settings):
+                controller.config = config_manager.get_config()
+                if hasattr(controller, '_sync_performance_profile'):
+                    controller._sync_performance_profile()
                 return jsonify({
                     "status": "success",
                     "message": "Settings updated successfully"
@@ -618,11 +638,21 @@ def capture_sample():
                 "code": "INVALID_GESTURE"
             }), 400
             
+        previous_count = len(controller.training_data.get(gesture, []))
         sample_count = controller.capture_training_sample(gesture)
-        
+
+        if sample_count > previous_count:
+            return jsonify({
+                "status": "success",
+                "captured": True,
+                "message": f"Sample captured for {gesture}",
+                "sample_count": sample_count
+            })
+
         return jsonify({
-            "status": "success", 
-            "message": f"Sample captured for {gesture}",
+            "status": "warning",
+            "captured": False,
+            "message": "No valid hand landmarks detected. Keep hand clearly visible and stable.",
             "sample_count": sample_count
         })
             
@@ -706,7 +736,10 @@ def get_training_status():
             "total_samples": status["total_samples"],
             "is_training": status["is_training"],
             "gestures_trained": status["gestures_trained"],
-            "format_version": status["format_version"]
+            "format_version": status["format_version"],
+            "gesture_stats": status.get("gesture_stats", {}),
+            "min_samples_per_gesture": status.get("min_samples_per_gesture", 5),
+            "ready_for_training": status.get("ready_for_training", False)
         })
     except Exception as e:
         logger.error(f"Training status error: {e}")
@@ -967,7 +1000,8 @@ if __name__ == '__main__':
             port=5000, 
             debug=False,
             threaded=True,
-            use_reloader=False
+            use_reloader=False,
+            load_dotenv=False
         )
         
     except Exception as e:

@@ -1,6 +1,7 @@
 import os
 import json
 import platform
+import urllib.request
 import cv2
 import numpy as np
 from typing import TYPE_CHECKING, Any
@@ -8,13 +9,22 @@ from logging_config import logger, log_exceptions
 
 try:
     import mediapipe as mp
-    if not hasattr(mp, "solutions"):
-        raise ImportError("mediapipe.solutions is unavailable")
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
     mp = None
     MEDIAPIPE_AVAILABLE = False
     logger.warning("MediaPipe not available. Hand tracking features will be disabled.")
+
+MEDIAPIPE_SOLUTIONS_AVAILABLE = MEDIAPIPE_AVAILABLE and hasattr(mp, "solutions")
+MEDIAPIPE_TASKS_AVAILABLE = False
+if MEDIAPIPE_AVAILABLE:
+    try:
+        from mediapipe.tasks import python as mp_tasks_python
+        from mediapipe.tasks.python import vision as mp_tasks_vision
+        MEDIAPIPE_TASKS_AVAILABLE = True
+    except Exception:
+        mp_tasks_python = None
+        mp_tasks_vision = None
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
@@ -249,6 +259,7 @@ class AccessibilityController:
         self.cap: Optional[cv2.VideoCapture] = None
         self.processing_thread: Optional[threading.Thread] = None
         self.shutdown_event = threading.Event()
+        self.current_frame_id = 0
         
         # Mouse control
         self.mouse_controller = MouseController() if MouseController else None
@@ -266,6 +277,10 @@ class AccessibilityController:
         self.is_training = False
         self.training_gesture: Optional[str] = None
         self.training_data: Dict[str, List[Dict]] = {}
+        self.gesture_prototypes: Dict[str, np.ndarray] = {}
+        self.latest_keypoints: Optional[np.ndarray] = None
+        self.latest_hand_detected: bool = False
+        self.latest_keypoints_timestamp: float = 0.0
         self._load_training_data()
         
         # Performance monitoring
@@ -277,6 +292,37 @@ class AccessibilityController:
             'memory_usage': 0,
             'avg_frame_time': 0
         }
+        self._mp_last_timestamp_ms = 0
+        self._inference_frame_counter = 0
+        self._inference_interval = max(1, int(getattr(self.config, 'inference_interval', 2)))
+        self._last_predicted_gesture = "none"
+        self._last_prediction_confidence = 0.0
+        self.last_recognition_source = "none"
+        self._cursor_mode_toggled_for_current_hold = False
+        self._processed_frame_counter = 0
+        self._read_timeout_configured = False
+        self._last_detection_results = None
+        self._detection_frame_counter = 0
+        self._detection_interval = max(1, int(getattr(self.config, 'detection_interval', 2)))
+        self._sync_performance_profile()
+
+    @log_exceptions
+    def _sync_performance_profile(self) -> None:
+        """Apply performance profile and clamp intervals from current config."""
+        mode = str(getattr(self.config, 'performance_mode', 'balanced')).lower()
+
+        detection_interval = max(1, min(6, int(getattr(self.config, 'detection_interval', 2))))
+        inference_interval = max(1, min(6, int(getattr(self.config, 'inference_interval', 2))))
+
+        if mode == 'max_accuracy':
+            detection_interval = 1
+            inference_interval = 1
+        elif mode == 'max_fps':
+            detection_interval = max(detection_interval, 3)
+            inference_interval = max(inference_interval, 3)
+
+        self._detection_interval = detection_interval
+        self._inference_interval = inference_interval
 
     @log_exceptions
     def _initialize_mediapipe(self) -> None:
@@ -307,21 +353,98 @@ class AccessibilityController:
             
             # Force garbage collection
             gc.collect()
-            
-            # Fresh initialization
-            self.mp_hands = mp.solutions.hands
-            self.hands = self.mp_hands.Hands(
-                static_image_mode=False,
-                max_num_hands=2,
-                min_detection_confidence=0.7,
-                min_tracking_confidence=0.7
-            )
-            self.mp_draw = mp.solutions.drawing_utils
-            logger.info("MediaPipe initialized successfully")
+
+            if MEDIAPIPE_SOLUTIONS_AVAILABLE:
+                self.mp_hands = mp.solutions.hands
+                self.hands = self.mp_hands.Hands(
+                    static_image_mode=False,
+                    max_num_hands=2,
+                    min_detection_confidence=0.7,
+                    min_tracking_confidence=0.7
+                )
+                self.mp_draw = mp.solutions.drawing_utils
+                self.mediapipe_backend = "solutions"
+                logger.info("MediaPipe initialized successfully (solutions backend)")
+                return
+
+            if MEDIAPIPE_TASKS_AVAILABLE:
+                model_path = self._ensure_hand_landmarker_model()
+                if not model_path:
+                    logger.warning("MediaPipe Tasks model unavailable. Hand tracking features will be disabled.")
+                    self.hands = None
+                    self.mp_hands = None
+                    self.mp_draw = None
+                    return
+
+                options = mp_tasks_vision.HandLandmarkerOptions(
+                    base_options=mp_tasks_python.BaseOptions(model_asset_path=model_path),
+                    running_mode=mp_tasks_vision.RunningMode.VIDEO,
+                    num_hands=2,
+                    min_hand_detection_confidence=0.45,
+                    min_hand_presence_confidence=0.35,
+                    min_tracking_confidence=0.35,
+                )
+                self.hands = mp_tasks_vision.HandLandmarker.create_from_options(options)
+                self.mp_hands = None
+                self.mp_draw = None
+                self.mediapipe_backend = "tasks"
+                logger.info("MediaPipe initialized successfully (tasks backend)")
+                return
+
+            logger.warning("MediaPipe API is installed but no supported hand tracking backend is available.")
+            self.hands = None
+            self.mp_hands = None
+            self.mp_draw = None
         except Exception as e:
             logger.error(f"Failed to initialize MediaPipe: {e}")
             self.hands = None
             raise
+
+    def _ensure_hand_landmarker_model(self) -> Optional[str]:
+        """Ensure Hand Landmarker task model is available for MediaPipe Tasks backend."""
+        model_path = os.path.join("models", "hand_landmarker.task")
+        if os.path.exists(model_path):
+            return model_path
+
+        os.makedirs("models", exist_ok=True)
+        model_url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+
+        try:
+            logger.info("Downloading MediaPipe hand landmarker model...")
+            urllib.request.urlretrieve(model_url, model_path)
+            logger.info(f"Downloaded model to {model_path}")
+            return model_path
+        except Exception as e:
+            logger.error(f"Failed to download hand landmarker model: {e}")
+            return None
+
+    def _convert_tasks_results(self, task_result: Any) -> Any:
+        """Convert MediaPipe Tasks result to a structure compatible with existing code."""
+        if not task_result or not getattr(task_result, "hand_landmarks", None):
+            class EmptyResult:
+                multi_hand_landmarks = None
+            return EmptyResult()
+
+        class LandmarkPoint:
+            def __init__(self, x: float, y: float, z: float):
+                self.x = x
+                self.y = y
+                self.z = z
+
+        class LandmarkList:
+            def __init__(self, landmarks: list):
+                self.landmark = landmarks
+
+        class CompatResult:
+            def __init__(self, multi_hand_landmarks: list):
+                self.multi_hand_landmarks = multi_hand_landmarks
+
+        converted_hands = []
+        for hand in task_result.hand_landmarks:
+            converted = [LandmarkPoint(point.x, point.y, point.z) for point in hand]
+            converted_hands.append(LandmarkList(converted))
+
+        return CompatResult(converted_hands)
 
     @log_exceptions
     def _initialize_model(self) -> None:
@@ -468,6 +591,57 @@ class AccessibilityController:
         else:
             self.training_data = {}
 
+        self._refresh_gesture_prototypes()
+
+    @log_exceptions
+    def _refresh_gesture_prototypes(self) -> None:
+        """Build per-gesture prototype vectors from valid training samples."""
+        prototypes: Dict[str, np.ndarray] = {}
+        for gesture, samples in self.training_data.items():
+            valid_keypoints = []
+            for sample in samples:
+                if isinstance(sample, dict) and 'keypoints' in sample:
+                    keypoints = np.asarray(sample['keypoints'], dtype=np.float32)
+                    if self.validate_training_sample(keypoints):
+                        valid_keypoints.append(keypoints)
+
+            if valid_keypoints:
+                stack = np.stack(valid_keypoints)
+                prototypes[gesture] = np.mean(stack, axis=0)
+
+        self.gesture_prototypes = prototypes
+
+    @log_exceptions
+    def _recognize_by_prototype(self, landmarks: np.ndarray) -> Tuple[str, float]:
+        """Fallback recognizer using cosine similarity against trained gesture prototypes."""
+        if landmarks is None or len(landmarks) != 63 or np.all(landmarks == 0):
+            return "none", 0.0
+
+        if not self.gesture_prototypes:
+            return "none", 0.0
+
+        vector = np.asarray(landmarks, dtype=np.float32)
+        vector_norm = np.linalg.norm(vector)
+        if vector_norm == 0:
+            return "none", 0.0
+
+        best_gesture = "none"
+        best_similarity = 0.0
+
+        for gesture, prototype in self.gesture_prototypes.items():
+            prototype_norm = np.linalg.norm(prototype)
+            if prototype_norm == 0:
+                continue
+            similarity = float(np.dot(vector, prototype) / (vector_norm * prototype_norm))
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_gesture = gesture
+
+        # More permissive threshold for prototype matching
+        if best_similarity >= 0.72:
+            return best_gesture, best_similarity
+        return "none", best_similarity
+
     @log_exceptions
     def start_processing(self) -> bool:
         """Start the main processing loop in a separate thread"""
@@ -507,17 +681,25 @@ class AccessibilityController:
         self.running = True
         
         try:
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
+            self.cap = self._open_camera()
+            if self.cap is None:
                 logger.error("Could not open camera")
                 self.running = False
                 return
-            
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
+
+            self._read_timeout_configured = False
+            self._processed_frame_counter = 0
+            self._detection_frame_counter = 0
+            self._last_detection_results = None
+            self._sync_performance_profile()
             
             logger.info("Starting Accessibility Controller processing...")
-            self.speak("Accessibility controller started")
+            threading.Thread(
+                target=self.speak,
+                args=("Accessibility controller started",),
+                daemon=True,
+                name="AccessibilitySpeechInit"
+            ).start()
             
             # Performance monitoring
             start_time = time.time()
@@ -533,9 +715,12 @@ class AccessibilityController:
                     continue
                 
                 # Process frame
+                if self._processed_frame_counter % 120 == 0:
+                    self._sync_performance_profile()
                 processed_frame = self._process_frame(frame)
                 if processed_frame is not None:
                     self.current_frame = processed_frame
+                    self.current_frame_id += 1
                 
                 # Performance monitoring
                 frame_count += 1
@@ -550,7 +735,8 @@ class AccessibilityController:
                     start_time = time.time()
                 
                 # Memory management
-                if frame_count % 30 == 0:
+                self._processed_frame_counter += 1
+                if self._processed_frame_counter % 300 == 0:
                     self._cleanup_memory()
                 
                 # Maintain target FPS
@@ -563,6 +749,42 @@ class AccessibilityController:
             logger.info("Processing loop stopped")
 
     @log_exceptions
+    def _open_camera(self) -> Optional[cv2.VideoCapture]:
+        """Open camera using backend/index fallbacks for better Windows compatibility"""
+        backend_candidates = [None]
+        if hasattr(cv2, 'CAP_DSHOW'):
+            backend_candidates.append(cv2.CAP_DSHOW)
+        if hasattr(cv2, 'CAP_MSMF'):
+            backend_candidates.append(cv2.CAP_MSMF)
+
+        camera_indices = [0, 1]
+
+        for backend in backend_candidates:
+            for camera_index in camera_indices:
+                try:
+                    if backend is None:
+                        capture = cv2.VideoCapture(camera_index)
+                        backend_name = "default"
+                    else:
+                        capture = cv2.VideoCapture(camera_index, backend)
+                        backend_name = str(backend)
+
+                    if capture is not None and capture.isOpened():
+                        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
+                        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
+                        if hasattr(cv2, 'CAP_PROP_BUFFERSIZE'):
+                            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        logger.info(f"Camera opened (index={camera_index}, backend={backend_name})")
+                        return capture
+
+                    if capture is not None:
+                        capture.release()
+                except Exception as e:
+                    logger.debug(f"Camera open attempt failed (index={camera_index}, backend={backend}): {e}")
+
+        return None
+
+    @log_exceptions
     def _read_frame_with_timeout(self, timeout_ms: int = 1000) -> Tuple[bool, Optional[np.ndarray]]:
         """Read frame with timeout to prevent hanging - cross-platform implementation"""
         if self.cap is None:
@@ -570,11 +792,13 @@ class AccessibilityController:
         
         # Implementation for different platforms
         try:
-            # Try setting timeout if supported
-            if hasattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC'):
-                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
-            elif hasattr(cv2, 'CAP_PROP_TIMEOUT_MSEC'):
-                self.cap.set(cv2.CAP_PROP_TIMEOUT_MSEC, timeout_ms)
+            # Try setting timeout once if supported
+            if not self._read_timeout_configured:
+                if hasattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC'):
+                    self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+                elif hasattr(cv2, 'CAP_PROP_TIMEOUT_MSEC'):
+                    self.cap.set(cv2.CAP_PROP_TIMEOUT_MSEC, timeout_ms)
+                self._read_timeout_configured = True
             
             ret, frame = self.cap.read()
             
@@ -596,14 +820,35 @@ class AccessibilityController:
         """Process a single frame with comprehensive error handling"""
         try:
             frame = cv2.flip(frame, 1)
-            image, results = self.mediapipe_detection(frame)
-            image = self.draw_landmarks(image, results)
+
+            if getattr(self, "mediapipe_backend", "solutions") == "tasks":
+                self._detection_frame_counter += 1
+                run_detection = (self._detection_frame_counter % self._detection_interval == 0) or self._last_detection_results is None
+
+                if run_detection:
+                    detection_frame = frame
+                    frame_height, frame_width = frame.shape[:2]
+                    if frame_width > 640:
+                        detection_frame = cv2.resize(frame, (frame_width // 2, frame_height // 2), interpolation=cv2.INTER_AREA)
+                    _, results = self.mediapipe_detection(detection_frame)
+                    self._last_detection_results = results
+                else:
+                    results = self._last_detection_results
+
+                image = self.draw_landmarks(frame, results)
+            else:
+                image, results = self.mediapipe_detection(frame)
+                image = self.draw_landmarks(image, results)
             
             # Store current results for web interface
             self.current_results = results
             
             # Extract keypoints and recognize gesture
             keypoints = self.extract_keypoints(results)
+            self.latest_hand_detected = bool(results and results.multi_hand_landmarks)
+            if keypoints is not None and self.validate_training_sample(keypoints):
+                self.latest_keypoints = keypoints.copy()
+                self.latest_keypoints_timestamp = time.time()
             
             # Control cursor if in cursor mode and hand detected
             if results and results.multi_hand_landmarks and self.cursor_mode:
@@ -614,11 +859,21 @@ class AccessibilityController:
                 self._release_drag()
             
             # Recognize gesture and execute action
-            if self.model is not None and keypoints is not None:
-                gesture, confidence = self.recognize_gesture(keypoints)
+            if keypoints is not None:
+                self._inference_frame_counter += 1
+                if self._inference_frame_counter % self._inference_interval == 0:
+                    gesture, confidence = self.recognize_gesture(keypoints)
+                    self._last_predicted_gesture = gesture
+                    self._last_prediction_confidence = confidence
+                else:
+                    gesture = self._last_predicted_gesture
+                    confidence = self._last_prediction_confidence
+
                 self.current_gesture = gesture
+
+                confidence_threshold = max(0.2, float(getattr(self.config, 'gesture_confidence_threshold', 0.5)))
                 
-                if gesture != "none" and confidence > 0.5:
+                if gesture != "none" and confidence >= confidence_threshold:
                     logger.debug(f"Detected: {gesture} (confidence: {confidence:.2f})")
                 
                 self.execute_gesture_action(
@@ -681,10 +936,6 @@ class AccessibilityController:
         try:
             # Force garbage collection
             gc.collect()
-            
-            # Clear TensorFlow session if it exists
-            if tf is not None and hasattr(tf, 'keras'):
-                tf.keras.backend.clear_session()
                 
         except Exception as e:
             logger.warning(f"Memory cleanup error: {e}")
@@ -694,7 +945,8 @@ class AccessibilityController:
         """Maintain target FPS by sleeping if necessary"""
         try:
             elapsed = time.time() - loop_start
-            target_time = 1.0 / self.config.target_fps
+            target_fps = max(10, int(getattr(self.config, 'target_fps', 24)))
+            target_time = 1.0 / target_fps
             
             if elapsed < target_time:
                 time.sleep(target_time - elapsed)
@@ -722,6 +974,12 @@ class AccessibilityController:
         logger.info("Stopping accessibility controller...")
         self.running = False
         self.shutdown_event.set()
+
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
         
         # Wait for thread to finish with timeout
         if self.processing_thread and self.processing_thread.is_alive():
@@ -771,6 +1029,16 @@ class AccessibilityController:
             return image, None
 
         try:
+            if getattr(self, "mediapipe_backend", "solutions") == "tasks":
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+                timestamp_ms = int(time.time() * 1000)
+                if timestamp_ms <= self._mp_last_timestamp_ms:
+                    timestamp_ms = self._mp_last_timestamp_ms + 1
+                self._mp_last_timestamp_ms = timestamp_ms
+                task_result = self.hands.detect_for_video(mp_image, timestamp_ms)
+                return image, self._convert_tasks_results(task_result)
+
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image_rgb.flags.writeable = False
             results = self.hands.process(image_rgb)
@@ -778,7 +1046,11 @@ class AccessibilityController:
             image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
             return image_bgr, results
         except Exception as e:
-            logger.error(f"MediaPipe detection error: {e}")
+            error_text = str(e)
+            if "cannot schedule new futures after shutdown" in error_text.lower() or self.shutdown_event.is_set() or not self.running:
+                logger.debug(f"MediaPipe detection skipped during shutdown: {e}")
+            else:
+                logger.error(f"MediaPipe detection error: {e}")
             return image, None
 
     @log_exceptions
@@ -805,6 +1077,16 @@ class AccessibilityController:
     @log_exceptions
     def draw_landmarks(self, image: np.ndarray, results: Any) -> np.ndarray:
         """Draw hand landmarks on the image"""
+        if getattr(self, "mediapipe_backend", "solutions") == "tasks":
+            if results and getattr(results, 'multi_hand_landmarks', None):
+                height, width = image.shape[:2]
+                for hand_landmarks in results.multi_hand_landmarks:
+                    for lm in hand_landmarks.landmark:
+                        x = int(lm.x * width)
+                        y = int(lm.y * height)
+                        cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
+            return image
+
         if not self.mp_draw:
             return image
 
@@ -823,9 +1105,15 @@ class AccessibilityController:
     @log_exceptions
     def recognize_gesture(self, landmarks: np.ndarray) -> Tuple[str, float]:
         """Improved gesture recognition with proper preprocessing"""
-        if (self.model is None or self.scaler is None or landmarks is None or 
-            len(landmarks) != 63 or np.all(landmarks == 0)):
+        if landmarks is None or len(landmarks) != 63 or np.all(landmarks == 0):
+            self.last_recognition_source = "none"
             return "none", 0.0
+
+        # If model pipeline isn't ready, rely on trained-sample prototypes.
+        if self.model is None or self.scaler is None:
+            proto_gesture, proto_confidence = self._recognize_by_prototype(landmarks)
+            self.last_recognition_source = "prototype" if proto_gesture != "none" else "none"
+            return proto_gesture, proto_confidence
         
         try:
             # Check if scaler is fitted before transform
@@ -841,14 +1129,22 @@ class AccessibilityController:
             predicted_class = np.argmax(prediction)
             confidence = prediction[predicted_class]
             
-            # Use a more reasonable confidence threshold
-            if confidence > 0.6:  # Adjusted threshold
+            confidence_threshold = max(0.2, float(getattr(self.config, 'gesture_confidence_threshold', 0.5)))
+            if confidence >= confidence_threshold:
+                self.last_recognition_source = "model"
                 return self.gestures[predicted_class], confidence
-            else:
-                return "none", confidence
+
+            # Fallback to prototype matcher when NN confidence is low.
+            proto_gesture, proto_confidence = self._recognize_by_prototype(landmarks)
+            if proto_gesture != "none":
+                self.last_recognition_source = "prototype"
+                return proto_gesture, proto_confidence
+            self.last_recognition_source = "none"
+            return "none", confidence
                 
         except Exception as e:
             logger.error(f"Gesture recognition error: {e}")
+            self.last_recognition_source = "none"
             return "none", 0.0
 
     @log_exceptions
@@ -888,14 +1184,16 @@ class AccessibilityController:
             return
         
         current_time = time.time()
-        gesture_duration = current_time - self.gesture_start_time
-        
+
         # Handle new gesture
         if gesture != self.previous_gesture:
             self.gesture_start_time = current_time
             self.previous_gesture = gesture
+            self._cursor_mode_toggled_for_current_hold = False
             if gesture != "none":
                 self.speak(gesture.replace('_', ' '))
+
+        gesture_duration = current_time - self.gesture_start_time
         
         # Execute actions based on gesture
         action_map = {
@@ -995,9 +1293,10 @@ class AccessibilityController:
     @log_exceptions
     def toggle_cursor_mode(self, duration: float) -> None:
         """Toggle cursor mode with hold threshold"""
-        if duration > self.config.gesture_hold_time:
+        if duration > self.config.gesture_hold_time and not self._cursor_mode_toggled_for_current_hold:
             self.cursor_mode = not self.cursor_mode
             mode = "enabled" if self.cursor_mode else "disabled"
+            self._cursor_mode_toggled_for_current_hold = True
             self.speak(f"Cursor mode {mode}")
             self.gesture_start_time = time.time()  # Reset timer
 
@@ -1069,7 +1368,17 @@ class AccessibilityController:
         """Provide voice feedback with proper thread safety"""
         if not self.voice_enabled or not self.config.voice_feedback or not self.voice_engine:
             return
-        
+
+        threading.Thread(
+            target=self._speak_worker,
+            args=(text,),
+            daemon=True,
+            name="AccessibilitySpeech"
+        ).start()
+
+    @log_exceptions
+    def _speak_worker(self, text: str) -> None:
+        """Run speech on a dedicated worker to avoid blocking frame processing."""
         try:
             # Use a lock to ensure thread safety
             with self._speech_lock:
@@ -1082,7 +1391,7 @@ class AccessibilityController:
                 # Say new text
                 self.voice_engine.say(text)
                 self.voice_engine.runAndWait()
-                
+
         except Exception as e:
             logger.error(f"Speech error: {e}")
             # Try to reinitialize voice engine on failure
@@ -1213,45 +1522,44 @@ class AccessibilityController:
         if not self.is_training or gesture != self.training_gesture:
             logger.warning("Not in training mode or gesture mismatch")
             return 0
-        
-        if self.current_results and self.current_results.multi_hand_landmarks:
-            try:
-                # Extract keypoints from the current frame
-                keypoints = self.extract_keypoints(self.current_results)
-                
-                # Validate sample
-                if self.validate_training_sample(keypoints):
-                    # Add to training data with improved format
-                    sample = {
-                        'keypoints': keypoints,
-                        'timestamp': datetime.now().isoformat(),
-                        'gesture': gesture,
-                        'version': '2.0',  # Updated format version
-                        'normalized': True  # Flag indicating data is normalized
-                    }
-                    
-                    # Initialize if needed
-                    if gesture not in self.training_data:
-                        self.training_data[gesture] = []
-                    
-                    self.training_data[gesture].append(sample)
-                    
-                    # Save training data
-                    self.save_training_data()
-                    
-                    sample_count = len(self.training_data[gesture])
-                    logger.info(f"Captured sample {sample_count} for {gesture}")
-                    
-                    return sample_count
-                else:
-                    logger.warning("Invalid sample (validation failed)")
-                    return len(self.training_data.get(gesture, []))
-                
-            except Exception as e:
-                logger.error(f"Error capturing training sample: {e}")
+
+        try:
+            keypoints = None
+
+            # Prefer cached latest valid keypoints from processing loop
+            if self.latest_keypoints is not None and self.validate_training_sample(self.latest_keypoints):
+                keypoints = self.latest_keypoints.copy()
+            # Fallback to extracting from current results if available
+            elif self.current_results and self.current_results.multi_hand_landmarks:
+                extracted = self.extract_keypoints(self.current_results)
+                if extracted is not None and self.validate_training_sample(extracted):
+                    keypoints = extracted
+
+            if keypoints is None:
+                logger.warning("No valid hand landmarks detected for sample capture")
                 return len(self.training_data.get(gesture, []))
-        else:
-            logger.warning("No hand landmarks detected")
+
+            sample = {
+                'keypoints': keypoints,
+                'timestamp': datetime.now().isoformat(),
+                'gesture': gesture,
+                'version': '2.0',
+                'normalized': True
+            }
+
+            if gesture not in self.training_data:
+                self.training_data[gesture] = []
+
+            self.training_data[gesture].append(sample)
+            self.save_training_data()
+            self._refresh_gesture_prototypes()
+
+            sample_count = len(self.training_data[gesture])
+            logger.info(f"Captured sample {sample_count} for {gesture}")
+            return sample_count
+
+        except Exception as e:
+            logger.error(f"Error capturing training sample: {e}")
             return len(self.training_data.get(gesture, []))
 
     @log_exceptions
@@ -1269,6 +1577,7 @@ class AccessibilityController:
             
             with open(self.config.training_data_path, 'wb') as f:
                 pickle.dump(validated_data, f)
+            self._refresh_gesture_prototypes()
             logger.info("Training data saved successfully")
             return True
         except Exception as e:
@@ -1457,7 +1766,7 @@ class AccessibilityController:
             "format_version": "2.0",
             "gesture_stats": gesture_stats,
             "min_samples_per_gesture": 5,  # Recommended minimum
-            "ready_for_training": total_samples >= 15 and len([g for g in gesture_stats.values() if g >= 3]) >= 2
+            "ready_for_training": total_samples >= 10
         }
 
     @log_exceptions
@@ -1475,7 +1784,9 @@ class AccessibilityController:
                 logger.info("Reset all training data")
             
             # Save the changes
-            return self.save_training_data()
+            saved = self.save_training_data()
+            self._refresh_gesture_prototypes()
+            return saved
             
         except Exception as e:
             logger.error(f"Error resetting training data: {e}")

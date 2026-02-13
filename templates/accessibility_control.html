@@ -453,7 +453,7 @@
     <div class="main-content">
       <div class="video-section">
         <div class="video-container">
-          <img id="video" src="/video_feed" alt="Live Camera Feed" onerror="this.style.display='none'" />
+          <img id="video" src="/video_feed" alt="Live Camera Feed" />
           <div class="gesture-feedback" id="gesture-feedback"></div>
         </div>
 
@@ -1288,6 +1288,19 @@
     // Charts
     let fpsChart, latencyChart;
     const CHART_LENGTH = 50;
+    let videoRetryTimer = null;
+
+    function startVideoFeed() {
+      const video = document.getElementById("video");
+      if (!video) return;
+
+      if (videoRetryTimer) {
+        clearTimeout(videoRetryTimer);
+        videoRetryTimer = null;
+      }
+
+      video.src = `/video_feed?t=${Date.now()}`;
+    }
 
     // Initialize and start status updates
     document.addEventListener("DOMContentLoaded", function () {
@@ -1309,12 +1322,24 @@
       // Check video feed status
       const video = document.getElementById("video");
       video.onload = () => {
+        if (videoRetryTimer) {
+          clearTimeout(videoRetryTimer);
+          videoRetryTimer = null;
+        }
         document.getElementById("camera-status").textContent = "✅ Connected";
       };
       video.onerror = () => {
         document.getElementById("camera-status").textContent =
-          "❌ Not available";
+          "⚠️ Reconnecting...";
+        if (!videoRetryTimer) {
+          videoRetryTimer = setTimeout(() => {
+            videoRetryTimer = null;
+            startVideoFeed();
+          }, 1500);
+        }
       };
+
+      startVideoFeed();
 
       console.log("Initialization complete");
     });

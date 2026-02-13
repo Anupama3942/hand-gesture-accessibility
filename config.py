@@ -9,7 +9,7 @@ from logging_config import logger
 class SystemConfig:
     # General settings
     sensitivity: float = 1.0
-    voice_feedback: bool = True
+    voice_feedback: bool = False
     cursor_speed: float = 2.0
     scroll_speed: int = 40
     zoom_sensitivity: float = 1.2
@@ -25,9 +25,13 @@ class SystemConfig:
     secret_key: str = "default-secret-key-change-in-production"
     
     # Performance settings
-    camera_width: int = 1280
-    camera_height: int = 720
+    camera_width: int = 640
+    camera_height: int = 480
     target_fps: int = 30
+    performance_mode: str = "balanced"  # balanced | max_fps | max_accuracy
+    detection_interval: int = 2
+    inference_interval: int = 2
+    stream_jpeg_quality: int = 65
     max_history_size: int = 100
     
     # Path settings
@@ -50,7 +54,12 @@ class SystemConfig:
             (5 <= self.scroll_speed <= 200, "Scroll speed must be between 5 and 200"),
             (0.3 <= self.gesture_hold_time <= 5.0, "Gesture hold time must be between 0.3 and 5.0 seconds"),
             (0.2 <= self.gesture_confidence_threshold <= 0.99, "Confidence threshold must be between 0.2 and 0.99"),
-            (self.training_samples >= 3, "At least 3 training samples required")
+            (self.training_samples >= 3, "At least 3 training samples required"),
+            (10 <= self.target_fps <= 60, "Target FPS must be between 10 and 60"),
+            (self.performance_mode in {"balanced", "max_fps", "max_accuracy"}, "Performance mode must be balanced, max_fps, or max_accuracy"),
+            (1 <= self.detection_interval <= 6, "Detection interval must be between 1 and 6"),
+            (1 <= self.inference_interval <= 6, "Inference interval must be between 1 and 6"),
+            (40 <= self.stream_jpeg_quality <= 90, "Stream JPEG quality must be between 40 and 90")
         ]
         
         for condition, message in validations:
